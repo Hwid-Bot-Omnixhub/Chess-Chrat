@@ -1,0 +1,13 @@
+<resources>
+    <string name="app_name">KnightSight</string>
+    <string name="tab_board">Board</string>
+    <string name="tab_watcher">Watcher</string>
+    <string name="tab_drills">Drills</string>
+    <string name="overlay_channel_name">Chess Tactical Overlay</string>
+    <string name="overlay_channel_desc">Controls the live best-move arrow overlay and app watcher</string>
+    <string name="overlay_notification_title">KnightSight Watcher Active</string>
+    <string name="overlay_notification_standby">Watching for official chess apps in foreground</string>
+    <string name="overlay_notification_detected">%1$s active — Arrows synced</string>
+    <string name="action_toggle_arrows">Toggle Arrows</string>
+    <string name="action_stop_watcher">Stop</string>
+</resources>

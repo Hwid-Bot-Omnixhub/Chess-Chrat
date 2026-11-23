@@ -1,0 +1,6 @@
+{
+  "name": "KnightSight",
+  "description": "Real-time chess tactical assistant with app watcher, floating best-move arrow overlay, and engine analysis board.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
