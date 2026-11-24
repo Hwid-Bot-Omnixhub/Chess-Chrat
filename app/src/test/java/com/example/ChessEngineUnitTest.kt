@@ -275,6 +275,75 @@ class ChessEngineUnitTest {
   }
 
   @Test
+  fun boardFinderLocatesFullWidthPortraitBoardNotDivisibleBy8() {
+    val w = 260
+    val h = 577
+    val px = IntArray(w * h) { 0xFF262421.toInt() }
+    val by = 148
+    val sqF = w / 8f
+
+    for (y in by until (by + w)) {
+      val r = ((y - by) / sqF).toInt().coerceIn(0, 7)
+      for (x in 0 until w) {
+        val c = (x / sqF).toInt().coerceIn(0, 7)
+        val isLight = (r + c) % 2 == 0
+        val bg = if (isLight) 0xFFEEEED2.toInt() else 0xFF769656.toInt()
+        val sqLocalX = x - c * sqF
+        val sqLocalY = (y - by) - r * sqF
+        val inPiece =
+          (r <= 1 || r >= 6) &&
+            sqLocalX in (sqF * 0.25f)..(sqF * 0.75f) &&
+            sqLocalY in (sqF * 0.25f)..(sqF * 0.75f)
+        px[y * w + x] =
+          if (inPiece) (if (r <= 1) 0xFF222222.toInt() else 0xFFFAFAFA.toInt()) else bg
+      }
+    }
+
+    val rect = com.example.chessreviewer.BoardFinder.findInPixels(px, w, h)
+    assertNotNull("Expected BoardFinder to detect full-width 260px Chess.com board", rect)
+    assertTrue("Expected bx <= 3, got ${rect!!.x}", rect.x <= 3)
+    assertTrue("Expected by near $by, got ${rect.y}", kotlin.math.abs(rect.y - by) <= 4)
+    assertTrue("Expected full-width size >= 254, got ${rect.size}", rect.size >= 254)
+  }
+
+  @Test
+  fun boardFinderRejectsBotPickerMenuSoOverlayStaysWaiting() {
+    val w = 216
+    val h = 440
+    val px = IntArray(w * h) { 0xFF262421.toInt() }
+    // Simulate a 4-column bot avatar grid (not an 8x8 chessboard)
+    val cardW = 46
+    val cardH = 54
+    for (row in 0 until 4) {
+      for (col in 0 until 4) {
+        val x0 = 10 + col * 50
+        val y0 = 70 + row * 68
+        val cardColor = if ((row + col) % 2 == 0) 0xFF3A3835.toInt() else 0xFF4B4844.toInt()
+        for (dy in 0 until cardH) {
+          for (dx in 0 until cardW) {
+            px[(y0 + dy) * w + (x0 + dx)] = cardColor
+          }
+        }
+      }
+    }
+    val rect = com.example.chessreviewer.BoardFinder.findInPixels(px, w, h)
+    assertEquals("Menu screens must return null so overlay shows Waiting...", null, rect)
+  }
+
+  @Test
+  fun hubSyncsFastTwoPlyBotReplyPreservingTurnAndHistory() {
+    com.example.data.ChessAssistantHub.resetBoard()
+    // Simulate 1. d4 d5 occurring between scan frames
+    val afterD4D5Fen = "rnbqkbnr/ppp1pppp/8/3p4/3P4/8/PPP1PPPP/RNBQKBNR w KQkq - 0 2"
+    val synced = com.example.data.ChessAssistantHub.applyScannedBoard(afterD4D5Fen, whiteBottom = true)
+    assertTrue(synced)
+    val st = com.example.data.ChessAssistantHub.state.value
+    assertEquals(com.example.chess.PieceColor.WHITE, st.board.sideToMove)
+    assertEquals(listOf("d4", "d5"), st.moveHistory.map { it.san })
+    com.example.data.ChessAssistantHub.resetBoard()
+  }
+
+  @Test
   fun startingPositionHasNoPlantedBookTheoryTags() = runTest {
     val start = BoardState.startingPosition()
     val local = ChessEngine.analyze(start, depth = 2)

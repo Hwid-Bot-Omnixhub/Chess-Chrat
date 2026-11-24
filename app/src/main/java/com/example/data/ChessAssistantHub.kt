@@ -62,9 +62,10 @@ data class AssistantSharedState(
   val statsHudX: Int = 36,
   val statsHudY: Int = 1080,
   val autoBoardScanEnabled: Boolean = true,
+  val isBoardVisibleOnScreen: Boolean = false,
   val visionTemplatesReady: Boolean = false,
   val visionWhiteBottom: Boolean = true,
-  val boardCheckerStatus: String = "Auto Board Finder ready — enable Screen Capture or Shizuku",
+  val boardCheckerStatus: String = "Waiting for Chess.com / Lichess game...",
   val shizukuInstalled: Boolean = false,
   val shizukuRunning: Boolean = false,
   val shizukuReady: Boolean = false,
@@ -412,12 +413,26 @@ object ChessAssistantHub {
     _state.update { it.copy(autoBoardScanEnabled = enabled) }
   }
 
+  fun setBoardVisibleOnScreen(visible: Boolean) {
+    _state.update { current ->
+      if (current.isBoardVisibleOnScreen == visible) current
+      else {
+        current.copy(
+          isBoardVisibleOnScreen = visible,
+          boardCheckerStatus =
+            if (visible) current.boardCheckerStatus else "Waiting for chessboard...",
+        )
+      }
+    }
+  }
+
   fun setVisionLearned(whiteBottom: Boolean, status: String) {
     _state.update {
       it.copy(
         visionTemplatesReady = true,
         visionWhiteBottom = whiteBottom,
         flippedBoard = !whiteBottom,
+        isBoardVisibleOnScreen = true,
         boardCheckerStatus = status,
       )
     }
@@ -444,8 +459,8 @@ object ChessAssistantHub {
   }
 
   /**
-   * Applies a visually scanned board position. If a single legal move from the current position
-   * produces the scanned piece placement, it plays that move so Move Grades (!!, !, ✓) update live.
+   * Applies a visually scanned board position. Checks 1-ply and fast 2-ply legal transitions so
+   * even rapid bot replies preserve exact turn, castling rights, and Stockfish Move Grades.
    */
   fun applyScannedBoard(fullFen: String, whiteBottom: Boolean): Boolean {
     val scannedPlacement = fullFen.substringBefore(' ')
@@ -454,8 +469,10 @@ object ChessAssistantHub {
     if (currentPlacement == scannedPlacement) {
       _state.update {
         it.copy(
+          isBoardVisibleOnScreen = true,
           flippedBoard = !whiteBottom,
-          boardCheckerStatus = "Board verified (${if (current.sideToMove == PieceColor.WHITE) "White" else "Black"} to move)",
+          boardCheckerStatus =
+            "Watching (${if (current.sideToMove == PieceColor.WHITE) "White" else "Black"} to move)",
         )
       }
       return false
@@ -471,19 +488,56 @@ object ChessAssistantHub {
     if (matchingMove != null) {
       _state.update {
         it.copy(
+          isBoardVisibleOnScreen = true,
           flippedBoard = !whiteBottom,
-          boardCheckerStatus = "Move detected & synced",
+          boardCheckerStatus = "Move synced",
         )
       }
       return playMove(matchingMove)
+    }
+
+    // Check 2-ply transition in case both player and fast bot moved between captures
+    val scannedBoard = BoardState.fromFen(fullFen)
+    if (scannedBoard != null) {
+      val changedIndices =
+        (0 until 64).filter { idx -> current.squares[idx] != scannedBoard.squares[idx] }.toSet()
+      if (changedIndices.size in 2..6) {
+        val candM1 =
+          legal.filter { m ->
+            (m.promotion == null || m.promotion == PieceType.QUEEN) &&
+              (m.from.index in changedIndices || m.to.index in changedIndices)
+          }
+        for (m1 in candM1) {
+          val after1 = ChessRules.applyMove(current, m1)
+          val legal2 = ChessRules.generateLegalMoves(after1)
+          val m2 =
+            legal2.firstOrNull { move2 ->
+              (move2.promotion == null || move2.promotion == PieceType.QUEEN) &&
+                (move2.from.index in changedIndices || move2.to.index in changedIndices) &&
+                ChessRules.applyMove(after1, move2).toFen().substringBefore(' ') == scannedPlacement
+            }
+          if (m2 != null) {
+            _state.update {
+              it.copy(
+                isBoardVisibleOnScreen = true,
+                flippedBoard = !whiteBottom,
+                boardCheckerStatus = "Fast turn synced",
+              )
+            }
+            playMove(m1)
+            return playMove(m2)
+          }
+        }
+      }
     }
 
     val loaded = loadFen(fullFen, "Board Checker")
     if (loaded) {
       _state.update {
         it.copy(
+          isBoardVisibleOnScreen = true,
           flippedBoard = !whiteBottom,
-          boardCheckerStatus = "Position synced from screen",
+          boardCheckerStatus = "Board synced from screen",
         )
       }
     }

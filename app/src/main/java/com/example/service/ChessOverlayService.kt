@@ -214,7 +214,7 @@ class ChessOverlayService : Service() {
   private fun currentScreenGeometry(): Triple<Int, Int, Int> {
     val dm = resources.displayMetrics
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-      val bounds = windowManager.currentWindowMetrics.bounds
+      val bounds = windowManager.maximumWindowMetrics.bounds
       return Triple(bounds.width(), bounds.height(), dm.densityDpi)
     }
     return Triple(dm.widthPixels, dm.heightPixels, dm.densityDpi)
@@ -271,57 +271,30 @@ class ChessOverlayService : Service() {
     val state = ChessAssistantHub.state.value
 
     if (boardOverlayView == null) {
-      val baseBoardFlags =
+      val fixedBoardFlags =
         WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-      val initialBoardFlags =
-        if (state.overlayPassThrough) {
-          baseBoardFlags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-        } else {
-          baseBoardFlags
-        }
+          WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
 
       val bParams =
         WindowManager.LayoutParams(
           state.overlayBoardSizePx,
           state.overlayBoardSizePx,
           overlayType,
-          initialBoardFlags,
+          fixedBoardFlags,
           PixelFormat.TRANSLUCENT,
         ).apply {
           gravity = Gravity.TOP or Gravity.START
           x = state.overlayBoardX
           y = state.overlayBoardY
+          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            layoutInDisplayCutoutMode =
+              WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+          }
         }
 
-      val bView =
-        OverlayBoardCanvasView(
-          context = this,
-          onDragBy = { dx, dy ->
-            val lp = boardParams ?: return@OverlayBoardCanvasView
-            lp.x += dx
-            lp.y += dy
-            runCatching { windowManager.updateViewLayout(boardOverlayView, lp) }
-            ChessAssistantHub.updateOverlayBounds(lp.x, lp.y, lp.width)
-          },
-          onResizeBy = { delta ->
-            val lp = boardParams ?: return@OverlayBoardCanvasView
-            val nextSize = (lp.width + delta).coerceIn(360, 1280)
-            lp.width = nextSize
-            lp.height = nextSize
-            runCatching { windowManager.updateViewLayout(boardOverlayView, lp) }
-            ChessAssistantHub.updateOverlayBounds(lp.x, lp.y, nextSize)
-          },
-          onInteractionFinished = {
-            val lp = boardParams ?: return@OverlayBoardCanvasView
-            serviceScope.launch(Dispatchers.IO) {
-              prefsRepo.saveOverlayBounds(lp.x, lp.y, lp.width)
-            }
-          },
-          onSquaresMoveSynced = { from, to ->
-            ChessAssistantHub.playSquares(from, to)
-          },
-        )
+      val bView = OverlayBoardCanvasView(context = this)
       boardParams = bParams
       boardOverlayView = bView
       windowManager.addView(bView, bParams)
@@ -339,7 +312,7 @@ class ChessOverlayService : Service() {
         ).apply {
           gravity = Gravity.TOP or Gravity.START
           x = 24
-          y = 110
+          y = 104
         }
 
       val pView =
@@ -351,14 +324,15 @@ class ChessOverlayService : Service() {
             lp.y += dy
             runCatching { windowManager.updateViewLayout(controlPillView, lp) }
           },
-          onApplyBestMove = {
-            val top = ChessAssistantHub.state.value.analysis.topMoves.firstOrNull()
-            if (top != null) {
-              ChessAssistantHub.playMove(top.move)
+          onOpenApp = {
+            if (!BoardVisionScanner.isCaptureAvailable(applicationContext)) {
+              val openIntent =
+                Intent(this, MainActivity::class.java).apply {
+                  addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                }
+              startActivity(openIntent)
             }
           },
-          onLearnBoard = { runLearnFromService() },
-          onScanBoard = { runScanOnceFromService() },
           onToggleAutoScan = {
             val cur = ChessAssistantHub.state.value
             val next = !cur.autoBoardScanEnabled
@@ -368,40 +342,12 @@ class ChessOverlayService : Service() {
               runScanOnceFromService(isAuto = true)
             }
           },
-          onToggleGrid = {
-            val cur = ChessAssistantHub.state.value
-            ChessAssistantHub.setOverlayServiceState(
-              running = true,
-              gridVisible = !cur.overlayGridVisible,
-            )
-          },
-          onToggleLock = {
-            val cur = ChessAssistantHub.state.value
-            val nextPassThrough = !cur.overlayPassThrough
-            ChessAssistantHub.setOverlayServiceState(
-              running = true,
-              passThrough = nextPassThrough,
-              tapSync = if (nextPassThrough) false else cur.overlayTapSyncActive,
-            )
-          },
-          onToggleTapSync = {
-            val cur = ChessAssistantHub.state.value
-            val nextSync = !cur.overlayTapSyncActive
-            ChessAssistantHub.setOverlayServiceState(
-              running = true,
-              gridVisible = true,
-              // When turning tapSync off, immediately restore touch-through so the real game works!
-              passThrough = !nextSync,
-              tapSync = nextSync,
-            )
-          },
           onToggleStats = {
             val nextShow = !ChessAssistantHub.state.value.showFloatingStatsHud
             ChessAssistantHub.setShowFloatingStatsHud(nextShow)
             serviceScope.launch(Dispatchers.IO) { prefsRepo.updateShowFloatingStatsHud(nextShow) }
           },
           onFlipBoard = { ChessAssistantHub.toggleFlipped() },
-          onUndo = { ChessAssistantHub.undoMove() },
           onClose = { stopSelf() },
         )
       pillParams = pParams
@@ -469,24 +415,20 @@ class ChessOverlayService : Service() {
         ChessAssistantHub.state.collectLatest { st ->
           boardOverlayView?.let { bView ->
             bView.visibility =
-              if (st.overlayGridVisible) View.VISIBLE else View.GONE
+              if (st.overlayGridVisible && st.isBoardVisibleOnScreen) View.VISIBLE else View.GONE
             bView.updateState(st)
             boardParams?.let { lp ->
-              val baseFlags =
+              val fixedFlags =
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                  WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-              val targetFlags =
-                if (st.overlayPassThrough) {
-                  baseFlags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                } else {
-                  baseFlags
-                }
-              if (lp.flags != targetFlags ||
+                  WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                  WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                  WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+              if (lp.flags != fixedFlags ||
                 lp.x != st.overlayBoardX ||
                 lp.y != st.overlayBoardY ||
                 lp.width != st.overlayBoardSizePx
               ) {
-                lp.flags = targetFlags
+                lp.flags = fixedFlags
                 lp.x = st.overlayBoardX
                 lp.y = st.overlayBoardY
                 lp.width = st.overlayBoardSizePx
@@ -519,7 +461,6 @@ class ChessOverlayService : Service() {
               lastNotifiedAppPkg = detected?.packageName
               ChessAssistantHub.setDetectedForegroundApp(detected)
               if (detected != null) {
-                // Keep pass-through active so user can immediately play the chess app
                 ChessAssistantHub.setOverlayServiceState(
                   running = true,
                   gridVisible = true,
@@ -527,7 +468,7 @@ class ChessOverlayService : Service() {
                   tapSync = false,
                 )
                 if (BoardVisionScanner.isCaptureAvailable(applicationContext)) {
-                  delay(450L)
+                  delay(350L)
                   runScanOnceFromService(isAuto = true)
                 }
               }
@@ -538,7 +479,7 @@ class ChessOverlayService : Service() {
             ChessAssistantHub.setDetectedForegroundApp(null)
             updateNotification(null)
           }
-          delay(if (st.antiLagEnabled) 2000L else 1200L)
+          delay(if (st.antiLagEnabled) 1800L else 1000L)
         }
       }
   }
@@ -550,8 +491,6 @@ class ChessOverlayService : Service() {
         while (isActive) {
           val st = ChessAssistantHub.state.value
           if (st.autoBoardScanEnabled &&
-            st.overlayGridVisible &&
-            st.overlayPassThrough &&
             BoardVisionScanner.isCaptureAvailable(applicationContext)
           ) {
             BoardVisionScanner.scanBoardOnce(
@@ -561,7 +500,7 @@ class ChessOverlayService : Service() {
               pulseHideOverlay = ::setOverlayHiddenForCapture,
             )
           }
-          delay(if (st.antiLagEnabled) 1500L else 950L)
+          delay(if (st.antiLagEnabled) 680L else 380L)
         }
       }
   }

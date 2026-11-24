@@ -99,17 +99,15 @@ class ShizukuCapture(private val appContext: Context) {
         }
     }
 
-    fun grab(width: Int = 0, height: Int = 0, timeoutMs: Long = 5_000L): Bitmap? {
-        if (!isRunning()) {
-            lastError = "Shizuku is not running"
-            return null
-        }
+    fun bindService(timeoutMs: Long = 5_000L): ISecureShot? {
         if (!ready()) {
-            lastError = "Shizuku permission not granted"
+            lastError = if (isRunning()) "Shizuku permission not granted" else "Shizuku is not running"
             return null
         }
-        val svc = bindIfNeeded(timeoutMs) ?: return null
+        return bindIfNeeded(timeoutMs)
+    }
 
+    fun decodeFromSecureShot(svc: ISecureShot, width: Int = 0, height: Int = 0): Bitmap? {
         return try {
             val totalBytes = svc.capture(width, height)
             if (totalBytes <= 0) {
@@ -146,6 +144,11 @@ class ShizukuCapture(private val appContext: Context) {
             lastError = t.message ?: t.javaClass.simpleName
             null
         }
+    }
+
+    fun grab(width: Int = 0, height: Int = 0, timeoutMs: Long = 5_000L): Bitmap? {
+        val svc = bindService(timeoutMs) ?: return null
+        return decodeFromSecureShot(svc, width, height)
     }
 
     @Synchronized

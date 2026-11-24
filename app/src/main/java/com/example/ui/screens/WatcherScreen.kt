@@ -184,32 +184,19 @@ fun WatcherScreen(
         modifier = Modifier.fillMaxWidth().padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
       ) {
-        Row(
-          modifier = Modifier.fillMaxWidth(),
-          horizontalArrangement = Arrangement.SpaceBetween,
-          verticalAlignment = Alignment.CenterVertically,
-        ) {
-          Column(modifier = Modifier.weight(1f)) {
-            Text("Floating Arrow Overlay", style = MaterialTheme.typography.titleMedium)
-            Text(
-              text =
-                if (shared.overlayServiceRunning) {
-                  "Touch-through is ${if (shared.overlayPassThrough) "ON (real game is touchable)" else "OFF (Align mode active)"}. Tap Align / Done in the floating toolbar anytime."
-                } else {
-                  "Starts with touch-through ON so you can play your chess app uninterrupted."
-                },
-              style = MaterialTheme.typography.bodyMedium,
-              color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-          }
+        Column {
+          Text("Floating AI Watcher Overlay", style = MaterialTheme.typography.titleMedium)
+          Text(
+            text =
+              if (shared.overlayServiceRunning) {
+                "Auto Board Finder is running — displays arrows only during active games while keeping your game 100% touchable."
+              } else {
+                "Automatically locates the 8×8 board over Chess.com / Lichess and draws arrows with zero blocking."
+              },
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+          )
         }
-
-        ToggleSettingRow(
-          title = "Touch-Through Mode (Real Game Stays Touchable)",
-          checked = shared.overlayPassThrough,
-          onCheckedChange = viewModel::setOverlayPassThrough,
-          tag = "overlay_passthrough_switch",
-        )
 
         Button(
           onClick = { viewModel.toggleOverlayService() },
@@ -230,8 +217,8 @@ fun WatcherScreen(
           Spacer(modifier = Modifier.width(8.dp))
           Text(
             text =
-              if (shared.overlayServiceRunning) "Stop Floating Overlay & Watcher"
-              else "Start Floating Arrow Overlay",
+              if (shared.overlayServiceRunning) "Stop Floating Watcher Overlay"
+              else "Start Floating Watcher Overlay",
             style = MaterialTheme.typography.labelLarge,
           )
         }
@@ -519,13 +506,13 @@ fun WatcherScreen(
         }
 
         ToggleSettingRow(
-          title = "Show #2 Alternative Arrow (Cyan)",
+          title = "Show #2 Alternative Move Arrow (Cyan)",
           checked = shared.showSecondaryArrows,
           onCheckedChange = viewModel::setShowSecondaryArrows,
           tag = "toggle_secondary_arrow",
         )
         ToggleSettingRow(
-          title = "Show Opponent Threat Arrow (Red Dashed)",
+          title = "Show Opponent's Best Move Arrow (Enemy Turn)",
           checked = shared.showThreatArrow,
           onCheckedChange = viewModel::setShowThreatArrow,
           tag = "toggle_threat_arrow",

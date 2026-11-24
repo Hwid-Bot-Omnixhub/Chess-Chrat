@@ -25,8 +25,9 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /**
- * Coordinates non-root screen capture (Shizuku UserService OR standard MediaProjection),
- * automatic [BoardFinder], [Vision], and [Tracker] to locate, check, and track live chess boards.
+ * Watches active screens via Shizuku's [com.example.chessreviewer.ISecureShot] or MediaProjection,
+ * localizes any 8x8 chessboard via [BoardFinder], reads pieces with [Vision], and tracks turns
+ * with [Tracker] so live arrows follow real games automatically.
  */
 object BoardVisionScanner {
 
@@ -69,15 +70,11 @@ object BoardVisionScanner {
 
   fun refreshReadiness(context: Context) {
     val sc = ensureInitialized(context)
-    val installed = sc.shizuku.isAppInstalled()
-    val running = sc.shizuku.isRunning()
-    val ready = sc.shizuku.ready()
-    val projReady = projectionCapture.isActive
     ChessAssistantHub.setCaptureReadiness(
-      shizukuInstalled = installed,
-      shizukuRunning = running,
-      shizukuReady = ready,
-      mediaProjectionReady = projReady,
+      shizukuInstalled = sc.shizuku.isAppInstalled(),
+      shizukuRunning = sc.shizuku.isRunning(),
+      shizukuReady = sc.shizuku.ready(),
+      mediaProjectionReady = projectionCapture.isActive,
     )
   }
 
@@ -102,7 +99,7 @@ object BoardVisionScanner {
     refreshReadiness(context)
     ChessAssistantHub.setBoardCheckerStatus(
       if (projectionCapture.isActive) {
-        "Screen capture ready (no root) — auto Board Finder active"
+        "Watching for Chess.com / Lichess board..."
       } else {
         projectionCapture.lastError.ifBlank { "Could not start screen capture" }
       },
@@ -124,22 +121,16 @@ object BoardVisionScanner {
     return sc.shizuku.ready() || projectionCapture.isActive || sc.mode == SecureCapture.Mode.ROOT
   }
 
-  fun describeCaptureMethod(context: Context): String {
-    val sc = ensureInitialized(context)
-    return when {
-      sc.shizuku.ready() -> "Shizuku Active (Non-Root • Protected Boards OK)"
-      projectionCapture.isActive -> "Standard Screen Capture Active (Non-Root)"
-      sc.shizuku.isRunning() -> "Shizuku Running — Tap Grant Access"
-      sc.shizuku.isAppInstalled() -> "Shizuku Installed — Start Service or Enable Capture"
-      else -> "Not Ready — Enable Screen Capture or Start Shizuku"
-    }
-  }
-
   data class ScanOutcome(val success: Boolean, val message: String)
+
+  private data class CaptureAndRect(
+    val frame: Bitmap?,
+    val rect: BoardFinder.BoardRect?,
+    val error: String = "",
+  )
 
   private data class LocatedBoard(
     val downscaled: IntArray,
-    val autoFound: Boolean,
     val boardSizePx: Int,
   )
 
@@ -150,19 +141,25 @@ object BoardVisionScanner {
   ): ScanOutcome =
     scanMutex.withLock {
       val appCtx = context.applicationContext
-      val frame = captureCleanScreen(appCtx, pulseHideOverlay)
-        ?: return@withLock ScanOutcome(false, captureFailureMessage(appCtx))
+      val captured = captureAndFindBoard(appCtx, pulseHideOverlay)
+      val frame = captured.frame
+      if (frame == null) {
+        val msg = captured.error.ifBlank { captureFailureMessage(appCtx) }
+        ChessAssistantHub.setBoardCheckerStatus(msg)
+        return@withLock ScanOutcome(false, msg)
+      }
 
       val st = ChessAssistantHub.state.value
       val located =
         try {
-          locateAndCropBoard(appCtx, frame, st, allowManualFallback = true, prefsRepo = prefsRepo)
+          extractLocatedBoard(appCtx, frame, captured.rect, st, prefsRepo)
         } finally {
           frame.recycle()
         }
 
       if (located == null) {
-        val msg = "No 8×8 chessboard found on screen — open your chess game or tap Align"
+        ChessAssistantHub.setBoardVisibleOnScreen(false)
+        val msg = "No 8×8 chessboard visible on screen"
         ChessAssistantHub.setBoardCheckerStatus(msg)
         return@withLock ScanOutcome(false, msg)
       }
@@ -196,8 +193,7 @@ object BoardVisionScanner {
 
       ChessAssistantHub.loadFen(BoardState.STARTING_FEN, "Board Checker")
       val sideLabel = if (result.whiteBottom) "White at bottom" else "Black at bottom"
-      val foundPrefix = if (located.autoFound) "Board auto-found & theme learned" else "Learned piece theme"
-      val okMsg = "$foundPrefix ($sideLabel)"
+      val okMsg = "Board found & piece theme learned ($sideLabel)"
       ChessAssistantHub.setVisionLearned(result.whiteBottom, okMsg)
       ScanOutcome(true, okMsg)
     }
@@ -210,9 +206,10 @@ object BoardVisionScanner {
   ): ScanOutcome =
     scanMutex.withLock {
       val appCtx = context.applicationContext
-      val frame = captureCleanScreen(appCtx, pulseHideOverlay)
+      val captured = captureAndFindBoard(appCtx, pulseHideOverlay)
+      val frame = captured.frame
       if (frame == null) {
-        val msg = captureFailureMessage(appCtx)
+        val msg = captured.error.ifBlank { captureFailureMessage(appCtx) }
         if (!isAuto) ChessAssistantHub.setBoardCheckerStatus(msg)
         return@withLock ScanOutcome(false, msg)
       }
@@ -220,19 +217,15 @@ object BoardVisionScanner {
       val st = ChessAssistantHub.state.value
       val located =
         try {
-          locateAndCropBoard(
-            context = appCtx,
-            frame = frame,
-            fallbackState = st,
-            allowManualFallback = !isAuto || cachedTemplates != null,
-            prefsRepo = prefsRepo,
-          )
+          extractLocatedBoard(appCtx, frame, captured.rect, st, prefsRepo)
         } finally {
           frame.recycle()
         }
 
       if (located == null) {
-        val msg = "No 8×8 chessboard found on screen — open a chess board"
+        lastPixelSignature = 0L
+        ChessAssistantHub.setBoardVisibleOnScreen(false)
+        val msg = "Waiting for chessboard..."
         if (!isAuto) ChessAssistantHub.setBoardCheckerStatus(msg)
         return@withLock ScanOutcome(false, msg)
       }
@@ -240,12 +233,13 @@ object BoardVisionScanner {
       val sig = computeSignature(located.downscaled)
       val existingTemplates = cachedTemplates
 
-      // Anti-lag optimization: skip full Vision classification if board pixels did not change
+      // Anti-lag optimization: skip Vision classification when pixels are identical
       if (isAuto && existingTemplates != null && sig == lastPixelSignature && lastAppliedPlacement != null) {
-        return@withLock ScanOutcome(true, "Board unchanged")
+        ChessAssistantHub.setBoardVisibleOnScreen(true)
+        return@withLock ScanOutcome(true, "Board synced")
       }
 
-      // If piece theme hasn't been learned yet, try automatic Vision.learn() if board is at starting position
+      // Auto-learn automatically whenever a starting position appears
       if (existingTemplates == null) {
         val autoLearn = withContext(Dispatchers.Default) { Vision.learn(located.downscaled) }
         val newTpl = autoLearn.templates
@@ -270,17 +264,13 @@ object BoardVisionScanner {
             }
           }
           ChessAssistantHub.loadFen(BoardState.STARTING_FEN, "Board Checker")
-          val sideLabel = if (autoLearn.whiteBottom) "White at bottom" else "Black at bottom"
-          val msg = "Board found & theme auto-learned ($sideLabel)"
+          val sideLabel = if (autoLearn.whiteBottom) "White" else "Black"
+          val msg = "Game detected ($sideLabel at bottom)"
           ChessAssistantHub.setVisionLearned(autoLearn.whiteBottom, msg)
           return@withLock ScanOutcome(true, msg)
         } else {
-          val msg =
-            if (located.autoFound) {
-              "Board found (${located.boardSizePx}px) — tap Learn on a starting board once"
-            } else {
-              "Tap Learn on a starting board first"
-            }
+          ChessAssistantHub.setBoardVisibleOnScreen(true)
+          val msg = "Board found — start a new game or tap Learn Start"
           ChessAssistantHub.setBoardCheckerStatus(msg)
           return@withLock ScanOutcome(false, msg)
         }
@@ -292,20 +282,18 @@ object BoardVisionScanner {
           Vision.readPosition(located.downscaled, existingTemplates, effectiveWhiteBottom)
         }
 
-      // If read failed, check if user flipped sides or started a new game with a fresh theme
-      if (pos == null) {
-        if (Vision.lastProblem.contains("pawn on rank 1 or 8")) {
-          val flippedPos =
-            withContext(Dispatchers.Default) {
-              Vision.readPosition(located.downscaled, existingTemplates, !effectiveWhiteBottom)
-            }
-          if (flippedPos != null) {
-            effectiveWhiteBottom = !effectiveWhiteBottom
-            pos = flippedPos
+      if (pos == null && Vision.lastProblem.contains("pawn on rank 1 or 8")) {
+        val flippedPos =
+          withContext(Dispatchers.Default) {
+            Vision.readPosition(located.downscaled, existingTemplates, !effectiveWhiteBottom)
           }
+        if (flippedPos != null) {
+          effectiveWhiteBottom = !effectiveWhiteBottom
+          pos = flippedPos
         }
       }
 
+      // Check if a brand-new starting game or new piece theme started
       if (pos == null) {
         val relearn = withContext(Dispatchers.Default) { Vision.learn(located.downscaled) }
         val newTpl = relearn.templates
@@ -330,15 +318,15 @@ object BoardVisionScanner {
             }
           }
           ChessAssistantHub.loadFen(BoardState.STARTING_FEN, "Board Checker")
-          val sideLabel = if (relearn.whiteBottom) "White at bottom" else "Black at bottom"
-          val msg = "New game theme learned ($sideLabel)"
+          val sideLabel = if (relearn.whiteBottom) "White" else "Black"
+          val msg = "New game started ($sideLabel at bottom)"
           ChessAssistantHub.setVisionLearned(relearn.whiteBottom, msg)
           return@withLock ScanOutcome(true, msg)
         }
       }
 
       if (pos == null) {
-        val problem = Vision.lastProblem.ifBlank { "Board not recognized — check frame or Learn start" }
+        val problem = Vision.lastProblem.ifBlank { "Reading board..." }
         if (!isAuto) ChessAssistantHub.setBoardCheckerStatus(problem)
         return@withLock ScanOutcome(false, problem)
       }
@@ -351,84 +339,61 @@ object BoardVisionScanner {
       val fen = tracker.fen(pos)
       val placement = fen.substringBefore(' ')
       if (isAuto && placement == lastAppliedPlacement && effectiveWhiteBottom == !st.flippedBoard) {
+        ChessAssistantHub.setBoardVisibleOnScreen(true)
         return@withLock ScanOutcome(true, "Board synced")
       }
 
       lastAppliedPlacement = placement
       ChessAssistantHub.applyScannedBoard(fen, effectiveWhiteBottom)
-      val turnLabel = if (tracker.blackToMove) "Black" else "White"
-      val statusMsg =
-        if (located.autoFound) "Board found & synced ($turnLabel to move)"
-        else "Board checked ($turnLabel to move)"
-      ChessAssistantHub.setBoardCheckerStatus(statusMsg)
-      ScanOutcome(true, statusMsg)
+      ScanOutcome(true, "Watching (${if (tracker.blackToMove) "Black" else "White"} to move)")
     }
 
-  private suspend fun locateAndCropBoard(
+  private suspend fun extractLocatedBoard(
     context: Context,
     frame: Bitmap,
+    rect: BoardFinder.BoardRect?,
     fallbackState: AssistantSharedState,
-    allowManualFallback: Boolean,
     prefsRepo: PreferencesRepository?,
   ): LocatedBoard? {
+    val foundRect = rect ?: return null
     val fw = frame.width
     val fh = frame.height
     if (fw < 64 || fh < 64) return null
 
-    // 1. Always try automatic BoardFinder first
-    val foundRect = withContext(Dispatchers.Default) { BoardFinder.find(frame) }
-    if (foundRect != null) {
-      val (dispW, dispH) = displayDimensions(context, fw, fh)
-      val scaleX = dispW.toFloat() / fw.toFloat()
-      val scaleY = dispH.toFloat() / fh.toFloat()
-      val overlayX = (foundRect.x * scaleX).roundToInt().coerceAtLeast(0)
-      val overlayY = (foundRect.y * scaleY).roundToInt().coerceAtLeast(0)
-      val overlaySize = (foundRect.size * ((scaleX + scaleY) * 0.5f)).roundToInt()
-        .coerceIn(120, minOf(dispW, dispH))
+    val (dispW, dispH) = displayDimensions(context, fw, fh)
+    val scaleX = dispW.toFloat() / fw.toFloat()
+    val scaleY = dispH.toFloat() / fh.toFloat()
+    val overlayX = (foundRect.x * scaleX).roundToInt().coerceAtLeast(0)
+    val overlayY = (foundRect.y * scaleY).roundToInt().coerceAtLeast(0)
+    val overlaySize = (foundRect.size * ((scaleX + scaleY) * 0.5f)).roundToInt()
+      .coerceIn(120, minOf(dispW, dispH))
 
-      val shifted =
-        abs(fallbackState.overlayBoardX - overlayX) > 4 ||
-          abs(fallbackState.overlayBoardY - overlayY) > 4 ||
-          abs(fallbackState.overlayBoardSizePx - overlaySize) > 4
+    val shifted =
+      abs(fallbackState.overlayBoardX - overlayX) > 2 ||
+        abs(fallbackState.overlayBoardY - overlayY) > 2 ||
+        abs(fallbackState.overlayBoardSizePx - overlaySize) > 2
 
-      if (shifted) {
-        ChessAssistantHub.updateOverlayBounds(overlayX, overlayY, overlaySize)
-        if (prefsRepo != null) {
-          withContext(Dispatchers.IO) {
-            prefsRepo.saveOverlayBounds(overlayX, overlayY, overlaySize)
-          }
+    if (shifted) {
+      ChessAssistantHub.updateOverlayBounds(overlayX, overlayY, overlaySize)
+      if (prefsRepo != null) {
+        withContext(Dispatchers.IO) {
+          prefsRepo.saveOverlayBounds(overlayX, overlayY, overlaySize)
         }
-      }
-
-      val downscaled =
-        withContext(Dispatchers.Default) {
-          cropAndDownscale(frame, foundRect.x, foundRect.y, foundRect.size)
-        }
-      if (downscaled != null) {
-        return LocatedBoard(downscaled, autoFound = true, boardSizePx = overlaySize)
       }
     }
 
-    if (!allowManualFallback) return null
-
-    val (dispW, dispH) = displayDimensions(context, fw, fh)
-    val invScaleX = fw.toFloat() / dispW.toFloat()
-    val invScaleY = fh.toFloat() / dispH.toFloat()
-    val fx = (fallbackState.overlayBoardX * invScaleX).roundToInt()
-    val fy = (fallbackState.overlayBoardY * invScaleY).roundToInt()
-    val fSize = (fallbackState.overlayBoardSizePx * ((invScaleX + invScaleY) * 0.5f)).roundToInt()
     val downscaled =
       withContext(Dispatchers.Default) {
-        cropAndDownscale(frame, fx, fy, fSize)
+        cropAndDownscale(frame, foundRect.x, foundRect.y, foundRect.size)
       } ?: return null
 
-    return LocatedBoard(downscaled, autoFound = false, boardSizePx = fallbackState.overlayBoardSizePx)
+    return LocatedBoard(downscaled = downscaled, boardSizePx = overlaySize)
   }
 
   private fun displayDimensions(context: Context, fallbackW: Int, fallbackH: Int): Pair<Int, Int> {
     val wm = context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
     if (wm != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-      val bounds = wm.currentWindowMetrics.bounds
+      val bounds = wm.maximumWindowMetrics.bounds
       if (bounds.width() > 0 && bounds.height() > 0) {
         return bounds.width() to bounds.height()
       }
@@ -441,20 +406,40 @@ object BoardVisionScanner {
     }
   }
 
-  private suspend fun captureCleanScreen(
+  /**
+   * Captures a frame cleanly (hiding the overlay briefly so our arrows never obscure squares)
+   * and localizes any chessboard using [BoardFinder.findFromSecureShot] when Shizuku [com.example.chessreviewer.ISecureShot]
+   * is available, or [BoardFinder.find] over MediaProjection frames.
+   */
+  private suspend fun captureAndFindBoard(
     context: Context,
     pulseHideOverlay: (suspend (Boolean) -> Unit)?,
-  ): Bitmap? {
+  ): CaptureAndRect {
     val sc = ensureInitialized(context)
-    if (pulseHideOverlay != null && ChessAssistantHub.state.value.overlayGridVisible) {
+    if (pulseHideOverlay != null &&
+      ChessAssistantHub.state.value.overlayGridVisible &&
+      ChessAssistantHub.state.value.isBoardVisibleOnScreen
+    ) {
       pulseHideOverlay.invoke(true)
-      delay(65L)
+      delay(48L)
       return try {
         withContext(Dispatchers.IO) {
-          when {
-            sc.shizuku.ready() -> sc.grab()
+          val shot = if (sc.shizuku.ready()) sc.shizuku.bindService() else null
+          if (shot != null) {
+            val res = BoardFinder.findFromSecureShot(shot)
+            if (res.frame != null) {
+              return@withContext CaptureAndRect(res.frame, res.boardRect, res.error)
+            }
+          }
+          val fallbackBmp = when {
             projectionCapture.isActive -> projectionCapture.grab()
             else -> sc.grab()
+          }
+          if (fallbackBmp == null) {
+            CaptureAndRect(null, null, captureFailureMessage(context))
+          } else {
+            val rect = BoardFinder.find(fallbackBmp)
+            CaptureAndRect(fallbackBmp, rect)
           }
         }
       } finally {
@@ -462,12 +447,25 @@ object BoardVisionScanner {
         refreshReadiness(context)
       }
     }
+
     return try {
       withContext(Dispatchers.IO) {
-        when {
-          sc.shizuku.ready() -> sc.grab()
+        val shot = if (sc.shizuku.ready()) sc.shizuku.bindService() else null
+        if (shot != null) {
+          val res = BoardFinder.findFromSecureShot(shot)
+          if (res.frame != null) {
+            return@withContext CaptureAndRect(res.frame, res.boardRect, res.error)
+          }
+        }
+        val fallbackBmp = when {
           projectionCapture.isActive -> projectionCapture.grab()
           else -> sc.grab()
+        }
+        if (fallbackBmp == null) {
+          CaptureAndRect(null, null, captureFailureMessage(context))
+        } else {
+          val rect = BoardFinder.find(fallbackBmp)
+          CaptureAndRect(fallbackBmp, rect)
         }
       }
     } finally {
@@ -508,7 +506,6 @@ object BoardVisionScanner {
   }
 
   private fun computeSignature(downscaled: IntArray): Long {
-    // 64 center-of-square samples for ultra-fast O(1) frame change detection
     var hash = -3750763034362895579L
     for (r in 0 until 8) {
       val py = r * Vision.N + Vision.N / 2

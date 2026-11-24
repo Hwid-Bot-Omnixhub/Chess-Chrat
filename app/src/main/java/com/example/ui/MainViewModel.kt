@@ -441,7 +441,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
       _uiState.update {
         it.copy(
           statusMessage =
-            "Overlay started (touch-through ON — tap Align in the floating bar to position frame)",
+            "AI Watcher overlay started — Waiting for Chess.com or Lichess game",
         )
       }
     }
