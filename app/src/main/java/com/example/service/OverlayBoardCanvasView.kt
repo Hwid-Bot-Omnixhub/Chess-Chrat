@@ -7,7 +7,6 @@ import android.graphics.Color
 import android.graphics.DashPathEffect
 import android.graphics.Paint
 import android.graphics.Path
-import android.graphics.PointF
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.view.MotionEvent
@@ -196,8 +195,9 @@ class OverlayBoardCanvasView(
     if (sel != null) {
       drawSquareHighlight(canvas, sel, sqSize, selectHighlightPaint)
       for (dest in legalDestinations) {
-        val center = squareCenter(dest, sqSize)
-        canvas.drawCircle(center.x, center.y, sqSize * 0.16f, legalDotPaint)
+        val cx = squareCenterX(dest, sqSize)
+        val cy = squareCenterY(dest, sqSize)
+        canvas.drawCircle(cx, cy, sqSize * 0.16f, legalDotPaint)
       }
     }
 
@@ -225,7 +225,8 @@ class OverlayBoardCanvasView(
         for (idx in 0 until 64) {
           val piece = sharedState.board.squares[idx] ?: continue
           val sq = Square.fromIndex(idx)
-          val topLeft = squareTopLeft(sq, sqSize)
+          val left = squareLeft(sq, sqSize)
+          val top = squareTop(sq, sqSize)
           pieceGlyphPaint.color =
             if (piece.color == com.example.chess.PieceColor.WHITE) {
               Color.parseColor("#CCFFFFFF")
@@ -234,29 +235,31 @@ class OverlayBoardCanvasView(
             }
           canvas.drawText(
             piece.unicodeSymbol,
-            topLeft.x + sqSize * 0.76f,
-            topLeft.y + sqSize * 0.36f,
+            left + sqSize * 0.76f,
+            top + sqSize * 0.36f,
             pieceGlyphPaint,
           )
         }
       }
+    } else {
+      // Faint corner L-ticks when touch-through is active so board bounds stay clear without clutter
+      val tick = sqSize * 0.28f
+      val pad = 2f
+      canvas.drawLine(pad, pad, pad + tick, pad, framePaint)
+      canvas.drawLine(pad, pad, pad, pad + tick, framePaint)
+      canvas.drawLine(boardSize - pad, pad, boardSize - pad - tick, pad, framePaint)
+      canvas.drawLine(boardSize - pad, pad, boardSize - pad, pad + tick, framePaint)
+      canvas.drawLine(pad, boardSize - pad, pad + tick, boardSize - pad, framePaint)
+      canvas.drawLine(pad, boardSize - pad, pad, boardSize - pad - tick, framePaint)
+      canvas.drawLine(boardSize - pad, boardSize - pad, boardSize - pad - tick, boardSize - pad, framePaint)
+      canvas.drawLine(boardSize - pad, boardSize - pad, boardSize - pad, boardSize - pad - tick, framePaint)
     }
 
     // Draw tactical arrows (threat first, then #2, then #1 on top)
     val alphaInt = (sharedState.arrowOpacity * 255).toInt().coerceIn(70, 255)
     val analysis = sharedState.analysis
 
-    if (!sharedState.antiLagEnabled && sharedState.showThreatArrow && analysis.opponentThreat != null) {
-      drawArrow(
-        canvas = canvas,
-        move = analysis.opponentThreat.move,
-        sqSize = sqSize,
-        color = Color.argb(alphaInt, 239, 68, 68),
-        strokeWidth = sqSize * 0.11f,
-        dashed = true,
-        badgeLabel = "!",
-      )
-    } else if (sharedState.showThreatArrow && analysis.opponentThreat != null) {
+    if (sharedState.showThreatArrow && analysis.opponentThreat != null) {
       drawArrow(
         canvas = canvas,
         move = analysis.opponentThreat.move,
@@ -330,8 +333,9 @@ class OverlayBoardCanvasView(
   }
 
   private fun drawSquareHighlight(canvas: Canvas, sq: Square, sqSize: Float, paint: Paint) {
-    val tl = squareTopLeft(sq, sqSize)
-    canvas.drawRect(tl.x, tl.y, tl.x + sqSize, tl.y + sqSize, paint)
+    val left = squareLeft(sq, sqSize)
+    val top = squareTop(sq, sqSize)
+    canvas.drawRect(left, top, left + sqSize, top + sqSize, paint)
   }
 
   private fun drawArrow(
@@ -343,10 +347,12 @@ class OverlayBoardCanvasView(
     dashed: Boolean,
     badgeLabel: String,
   ) {
-    val start = squareCenter(move.from, sqSize)
-    val end = squareCenter(move.to, sqSize)
-    val dx = end.x - start.x
-    val dy = end.y - start.y
+    val startX = squareCenterX(move.from, sqSize)
+    val startY = squareCenterY(move.from, sqSize)
+    val endX = squareCenterX(move.to, sqSize)
+    val endY = squareCenterY(move.to, sqSize)
+    val dx = endX - startX
+    val dy = endY - startY
     val dist = hypot(dx, dy)
     if (dist < 1f) return
 
@@ -354,12 +360,11 @@ class OverlayBoardCanvasView(
     val headLen = sqSize * 0.36f
     val headAngle = Math.toRadians(30.0)
 
-    // Pull shaft slightly back from exact centers for cleaner visual hierarchy
     val trimStart = sqSize * 0.14f
-    val sx = start.x + cos(angle) * trimStart
-    val sy = start.y + sin(angle) * trimStart
-    val shaftEndX = end.x - cos(angle) * (headLen * 0.68f)
-    val shaftEndY = end.y - sin(angle) * (headLen * 0.68f)
+    val sx = startX + cos(angle) * trimStart
+    val sy = startY + sin(angle) * trimStart
+    val shaftEndX = endX - cos(angle) * (headLen * 0.68f)
+    val shaftEndY = endY - sin(angle) * (headLen * 0.68f)
 
     arrowGlowPaint.strokeWidth = strokeWidth + 6f
     canvas.drawLine(sx, sy, shaftEndX, shaftEndY, arrowGlowPaint)
@@ -370,41 +375,43 @@ class OverlayBoardCanvasView(
     canvas.drawLine(sx, sy, shaftEndX, shaftEndY, arrowShaftPaint)
 
     arrowHeadPath.reset()
-    arrowHeadPath.moveTo(end.x, end.y)
+    arrowHeadPath.moveTo(endX, endY)
     arrowHeadPath.lineTo(
-      (end.x - headLen * cos(angle - headAngle)).toFloat(),
-      (end.y - headLen * sin(angle - headAngle)).toFloat(),
+      (endX - headLen * cos(angle - headAngle)).toFloat(),
+      (endY - headLen * sin(angle - headAngle)).toFloat(),
     )
     arrowHeadPath.lineTo(
-      (end.x - headLen * cos(angle + headAngle)).toFloat(),
-      (end.y - headLen * sin(angle + headAngle)).toFloat(),
+      (endX - headLen * cos(angle + headAngle)).toFloat(),
+      (endY - headLen * sin(angle + headAngle)).toFloat(),
     )
     arrowHeadPath.close()
 
     arrowHeadPaint.color = color
     canvas.drawPath(arrowHeadPath, arrowHeadPaint)
 
-    // Rank badge near origin
     val badgeR = sqSize * 0.17f
-    val bx = start.x
-    val by = start.y
     badgeCirclePaint.color = color
-    canvas.drawCircle(bx, by, badgeR, badgeCirclePaint)
+    canvas.drawCircle(startX, startY, badgeR, badgeCirclePaint)
     badgeTextPaint.textSize = badgeR * 1.25f
-    val textY = by - (badgeTextPaint.descent() + badgeTextPaint.ascent()) / 2f
-    canvas.drawText(badgeLabel, bx, textY, badgeTextPaint)
+    val textY = startY - (badgeTextPaint.descent() + badgeTextPaint.ascent()) / 2f
+    canvas.drawText(badgeLabel, startX, textY, badgeTextPaint)
   }
 
-  private fun squareTopLeft(sq: Square, sqSize: Float): PointF {
+  private fun squareLeft(sq: Square, sqSize: Float): Float {
     val col = if (sharedState.flippedBoard) 7 - sq.file else sq.file
-    val row = if (sharedState.flippedBoard) sq.rank else 7 - sq.rank
-    return PointF(col * sqSize, row * sqSize)
+    return col * sqSize
   }
 
-  private fun squareCenter(sq: Square, sqSize: Float): PointF {
-    val tl = squareTopLeft(sq, sqSize)
-    return PointF(tl.x + sqSize * 0.5f, tl.y + sqSize * 0.5f)
+  private fun squareTop(sq: Square, sqSize: Float): Float {
+    val row = if (sharedState.flippedBoard) sq.rank else 7 - sq.rank
+    return row * sqSize
   }
+
+  private fun squareCenterX(sq: Square, sqSize: Float): Float =
+    squareLeft(sq, sqSize) + sqSize * 0.5f
+
+  private fun squareCenterY(sq: Square, sqSize: Float): Float =
+    squareTop(sq, sqSize) + sqSize * 0.5f
 
   private fun pointToSquare(x: Float, y: Float): Square? {
     val boardSize = minOf(width, height).toFloat()

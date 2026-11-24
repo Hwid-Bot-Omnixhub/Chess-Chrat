@@ -9,6 +9,7 @@
         tools:ignore="ProtectedPermissions" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <queries>
@@ -18,6 +19,7 @@
         <package android:name="uk.co.aifactory.chessfree" />
         <package android:name="com.chess.learn" />
         <package android:name="com.google.android.apps.chess" />
+        <package android:name="moe.shizuku.privileged.api" />
     </queries>
 
     <application
@@ -45,10 +47,10 @@
             android:name=".service.ChessOverlayService"
             android:enabled="true"
             android:exported="false"
-            android:foregroundServiceType="specialUse">
+            android:foregroundServiceType="specialUse|mediaProjection">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="Chess tactical arrow overlay and official chess app launch monitor" />
+                android:value="Chess tactical arrow overlay, visual board checker, and official chess app monitor" />
         </service>
     </application>
 

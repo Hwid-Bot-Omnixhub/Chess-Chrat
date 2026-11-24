@@ -1,5 +1,6 @@
 package com.example.service
 
+import android.app.Activity
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -9,15 +10,20 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.PixelFormat
+import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.IBinder
 import android.provider.Settings
 import android.view.Gravity
+import android.view.View
 import android.view.WindowManager
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import androidx.core.content.IntentCompat
 import com.example.MainActivity
 import com.example.R
+import com.example.chess.ChessEngine
 import com.example.data.ChessAssistantHub
 import com.example.data.PreferencesRepository
 import kotlinx.coroutines.CoroutineScope
@@ -27,8 +33,10 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class ChessOverlayService : Service() {
 
@@ -36,11 +44,50 @@ class ChessOverlayService : Service() {
     const val ACTION_START = "com.example.action.START_OVERLAY"
     const val ACTION_TOGGLE_ARROWS = "com.example.action.TOGGLE_ARROWS"
     const val ACTION_STOP = "com.example.action.STOP_OVERLAY"
+    const val ACTION_INIT_PROJECTION = "com.example.action.INIT_PROJECTION"
+    const val ACTION_LEARN_BOARD = "com.example.action.LEARN_BOARD"
+    const val ACTION_SCAN_BOARD = "com.example.action.SCAN_BOARD"
+
+    const val EXTRA_RESULT_CODE = "extra_result_code"
+    const val EXTRA_DATA = "extra_data"
+
     private const val CHANNEL_ID = "knightsight_overlay_channel"
     private const val NOTIFICATION_ID = 4102
 
     fun start(context: Context) {
       val intent = Intent(context, ChessOverlayService::class.java).apply { action = ACTION_START }
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        context.startForegroundService(intent)
+      } else {
+        context.startService(intent)
+      }
+    }
+
+    fun startWithProjection(context: Context, resultCode: Int, data: Intent) {
+      val intent =
+        Intent(context, ChessOverlayService::class.java).apply {
+          action = ACTION_INIT_PROJECTION
+          putExtra(EXTRA_RESULT_CODE, resultCode)
+          putExtra(EXTRA_DATA, data)
+        }
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        context.startForegroundService(intent)
+      } else {
+        context.startService(intent)
+      }
+    }
+
+    fun triggerLearn(context: Context) {
+      val intent = Intent(context, ChessOverlayService::class.java).apply { action = ACTION_LEARN_BOARD }
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        context.startForegroundService(intent)
+      } else {
+        context.startService(intent)
+      }
+    }
+
+    fun triggerScan(context: Context) {
+      val intent = Intent(context, ChessOverlayService::class.java).apply { action = ACTION_SCAN_BOARD }
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
         context.startForegroundService(intent)
       } else {
@@ -67,14 +114,24 @@ class ChessOverlayService : Service() {
 
   private var watcherJob: Job? = null
   private var stateJob: Job? = null
+  private var boardScannerJob: Job? = null
   private var lastNotifiedAppPkg: String? = null
+  @Volatile private var hasProjectionGrant: Boolean = false
 
   override fun onCreate() {
     super.onCreate()
     windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
     prefsRepo = PreferencesRepository(applicationContext)
     watcherMonitor = AppWatcherMonitor(applicationContext)
+    ChessEngine.initNativeEngine(applicationContext)
+    BoardVisionScanner.ensureInitialized(applicationContext)
     createNotificationChannel()
+
+    serviceScope.launch {
+      val prefs = prefsRepo.preferencesFlow.first()
+      BoardVisionScanner.restoreSavedTemplates(prefs.visionTemplates, prefs.visionWhiteBottom)
+      BoardVisionScanner.refreshReadiness(applicationContext)
+    }
   }
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -83,16 +140,29 @@ class ChessOverlayService : Service() {
         stopSelf()
         return START_NOT_STICKY
       }
-      ACTION_TOGGLE_ARROWS -> {
-        val current = ChessAssistantHub.state.value
-        ChessAssistantHub.setOverlayServiceState(
-          running = true,
-          gridVisible = !current.overlayGridVisible,
-        )
+      ACTION_INIT_PROJECTION -> {
+        val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
+        val data = IntentCompat.getParcelableExtra(intent, EXTRA_DATA, Intent::class.java)
+        if (resultCode == Activity.RESULT_OK && data != null) {
+          hasProjectionGrant = true
+          promoteToForeground(withProjection = true)
+          initMediaProjectionCapture(resultCode, data)
+        } else {
+          promoteToForeground(withProjection = false)
+        }
+      }
+      else -> {
+        promoteToForeground(withProjection = hasProjectionGrant)
       }
     }
 
-    promoteToForeground()
+    if (intent?.action == ACTION_TOGGLE_ARROWS) {
+      val current = ChessAssistantHub.state.value
+      ChessAssistantHub.setOverlayServiceState(
+        running = true,
+        gridVisible = !current.overlayGridVisible,
+      )
+    }
 
     if (!Settings.canDrawOverlays(this)) {
       ChessAssistantHub.setOverlayServiceState(running = false)
@@ -104,19 +174,88 @@ class ChessOverlayService : Service() {
     ChessAssistantHub.setOverlayServiceState(running = true)
     observeState()
     startWatcherLoop()
+    startBoardCheckerLoop()
+
+    when (intent?.action) {
+      ACTION_LEARN_BOARD -> runLearnFromService()
+      ACTION_SCAN_BOARD -> runScanOnceFromService()
+    }
 
     return START_STICKY
   }
 
-  private fun promoteToForeground() {
+  private fun promoteToForeground(withProjection: Boolean) {
     val notification = buildNotification(detectedAppName = null)
     val fgsType =
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-        ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+        if (withProjection) {
+          ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE or
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+        } else {
+          ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+        }
       } else {
         0
       }
     ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, fgsType)
+  }
+
+  private fun initMediaProjectionCapture(resultCode: Int, data: Intent) {
+    val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as? MediaProjectionManager ?: return
+    val projection =
+      runCatching { mgr.getMediaProjection(resultCode, data) }.getOrNull() ?: run {
+        ChessAssistantHub.setBoardCheckerStatus("MediaProjection permission denied or expired")
+        return
+      }
+    val (w, h, dpi) = currentScreenGeometry()
+    BoardVisionScanner.startMediaProjection(applicationContext, projection, w, h, dpi)
+  }
+
+  private fun currentScreenGeometry(): Triple<Int, Int, Int> {
+    val dm = resources.displayMetrics
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+      val bounds = windowManager.currentWindowMetrics.bounds
+      return Triple(bounds.width(), bounds.height(), dm.densityDpi)
+    }
+    return Triple(dm.widthPixels, dm.heightPixels, dm.densityDpi)
+  }
+
+  private fun runLearnFromService() {
+    serviceScope.launch {
+      val outcome =
+        BoardVisionScanner.learnStartingBoard(
+          context = applicationContext,
+          prefsRepo = prefsRepo,
+          pulseHideOverlay = ::setOverlayHiddenForCapture,
+        )
+      withContext(Dispatchers.Main) {
+        Toast.makeText(applicationContext, outcome.message, Toast.LENGTH_SHORT).show()
+      }
+    }
+  }
+
+  private fun runScanOnceFromService() {
+    serviceScope.launch {
+      val outcome =
+        BoardVisionScanner.scanBoardOnce(
+          context = applicationContext,
+          isAuto = false,
+          pulseHideOverlay = ::setOverlayHiddenForCapture,
+        )
+      if (!outcome.success) {
+        withContext(Dispatchers.Main) {
+          Toast.makeText(applicationContext, outcome.message, Toast.LENGTH_SHORT).show()
+        }
+      }
+    }
+  }
+
+  private suspend fun setOverlayHiddenForCapture(hidden: Boolean) {
+    withContext(Dispatchers.Main.immediate) {
+      boardOverlayView?.visibility =
+        if (hidden || !ChessAssistantHub.state.value.overlayGridVisible) View.INVISIBLE
+        else View.VISIBLE
+    }
   }
 
   private fun attachOverlayWindowsIfNeeded() {
@@ -131,13 +270,22 @@ class ChessOverlayService : Service() {
     val state = ChessAssistantHub.state.value
 
     if (boardOverlayView == null) {
+      val baseBoardFlags =
+        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+      val initialBoardFlags =
+        if (state.overlayPassThrough) {
+          baseBoardFlags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        } else {
+          baseBoardFlags
+        }
+
       val bParams =
         WindowManager.LayoutParams(
           state.overlayBoardSizePx,
           state.overlayBoardSizePx,
           overlayType,
-          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+          initialBoardFlags,
           PixelFormat.TRANSLUCENT,
         ).apply {
           gravity = Gravity.TOP or Gravity.START
@@ -208,6 +356,22 @@ class ChessOverlayService : Service() {
               ChessAssistantHub.playMove(top.move)
             }
           },
+          onLearnBoard = { runLearnFromService() },
+          onScanBoard = { runScanOnceFromService() },
+          onToggleAutoScan = {
+            val cur = ChessAssistantHub.state.value
+            val next = !cur.autoBoardScanEnabled
+            if (next && !cur.visionTemplatesReady) {
+              Toast.makeText(
+                applicationContext,
+                "Tap Learn on a starting board first",
+                Toast.LENGTH_SHORT,
+              ).show()
+            } else {
+              ChessAssistantHub.setAutoBoardScan(next)
+              serviceScope.launch(Dispatchers.IO) { prefsRepo.updateAutoBoardScan(next) }
+            }
+          },
           onToggleGrid = {
             val cur = ChessAssistantHub.state.value
             ChessAssistantHub.setOverlayServiceState(
@@ -230,7 +394,8 @@ class ChessOverlayService : Service() {
             ChessAssistantHub.setOverlayServiceState(
               running = true,
               gridVisible = true,
-              passThrough = if (nextSync) false else cur.overlayPassThrough,
+              // When turning tapSync off, immediately restore touch-through so the real game works!
+              passThrough = !nextSync,
               tapSync = nextSync,
             )
           },
@@ -308,7 +473,7 @@ class ChessOverlayService : Service() {
         ChessAssistantHub.state.collectLatest { st ->
           boardOverlayView?.let { bView ->
             bView.visibility =
-              if (st.overlayGridVisible) android.view.View.VISIBLE else android.view.View.GONE
+              if (st.overlayGridVisible) View.VISIBLE else View.GONE
             bView.updateState(st)
             boardParams?.let { lp ->
               val baseFlags =
@@ -320,8 +485,16 @@ class ChessOverlayService : Service() {
                 } else {
                   baseFlags
                 }
-              if (lp.flags != targetFlags) {
+              if (lp.flags != targetFlags ||
+                lp.x != st.overlayBoardX ||
+                lp.y != st.overlayBoardY ||
+                lp.width != st.overlayBoardSizePx
+              ) {
                 lp.flags = targetFlags
+                lp.x = st.overlayBoardX
+                lp.y = st.overlayBoardY
+                lp.width = st.overlayBoardSizePx
+                lp.height = st.overlayBoardSizePx
                 runCatching { windowManager.updateViewLayout(bView, lp) }
               }
             }
@@ -329,7 +502,7 @@ class ChessOverlayService : Service() {
           controlPillView?.updateState(st)
           statsHudView?.let { sView ->
             sView.visibility =
-              if (st.showFloatingStatsHud) android.view.View.VISIBLE else android.view.View.GONE
+              if (st.showFloatingStatsHud) View.VISIBLE else View.GONE
             sView.updateState(st)
           }
         }
@@ -349,8 +522,13 @@ class ChessOverlayService : Service() {
               lastNotifiedAppPkg = detected?.packageName
               ChessAssistantHub.setDetectedForegroundApp(detected)
               if (detected != null) {
-                // Auto-reveal tactical overlay when an official chess app comes to foreground
-                ChessAssistantHub.setOverlayServiceState(running = true, gridVisible = true)
+                // Keep pass-through active so user can immediately play the chess app
+                ChessAssistantHub.setOverlayServiceState(
+                  running = true,
+                  gridVisible = true,
+                  passThrough = true,
+                  tapSync = false,
+                )
               }
               updateNotification(detected?.displayName)
             }
@@ -360,6 +538,29 @@ class ChessOverlayService : Service() {
             updateNotification(null)
           }
           delay(if (st.antiLagEnabled) 2000L else 1200L)
+        }
+      }
+  }
+
+  private fun startBoardCheckerLoop() {
+    if (boardScannerJob != null) return
+    boardScannerJob =
+      serviceScope.launch(Dispatchers.Default) {
+        while (isActive) {
+          val st = ChessAssistantHub.state.value
+          if (st.autoBoardScanEnabled &&
+            st.visionTemplatesReady &&
+            st.overlayGridVisible &&
+            st.overlayPassThrough &&
+            BoardVisionScanner.isCaptureAvailable(applicationContext)
+          ) {
+            BoardVisionScanner.scanBoardOnce(
+              context = applicationContext,
+              isAuto = true,
+              pulseHideOverlay = ::setOverlayHiddenForCapture,
+            )
+          }
+          delay(if (st.antiLagEnabled) 1700L else 1050L)
         }
       }
   }
@@ -430,7 +631,10 @@ class ChessOverlayService : Service() {
   override fun onDestroy() {
     super.onDestroy()
     watcherJob?.cancel()
+    boardScannerJob?.cancel()
     stateJob?.cancel()
+    hasProjectionGrant = false
+    BoardVisionScanner.stopMediaProjection(applicationContext)
     boardOverlayView?.let { runCatching { windowManager.removeView(it) } }
     controlPillView?.let { runCatching { windowManager.removeView(it) } }
     statsHudView?.let { runCatching { windowManager.removeView(it) } }

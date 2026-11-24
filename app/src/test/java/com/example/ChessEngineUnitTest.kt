@@ -148,4 +148,81 @@ class ChessEngineUnitTest {
     assertEquals(1, stats.goodCount)
     assertEquals(3, stats.totalGradedMoves)
   }
+
+  @Test
+  fun visionLearnsTemplatesReadsStartBoardAndTrackerInfersMoves() {
+    val px = IntArray(com.example.chessreviewer.Vision.B * com.example.chessreviewer.Vision.B)
+    val startPos = arrayOf(
+      "rnbqkbnr",
+      "pppppppp",
+      "........",
+      "........",
+      "........",
+      "........",
+      "PPPPPPPP",
+      "RNBQKBNR",
+    )
+
+    fun drawSquare(row: Int, col: Int, piece: Char) {
+      val n = com.example.chessreviewer.Vision.N
+      val isLight = (row + col) % 2 == 0
+      val bg = if (isLight) 0xFFEEEED2.toInt() else 0xFF769656.toInt()
+      val fg = if (piece.isUpperCase()) 0xFFFAFAFA.toInt() else 0xFF1F1F1F.toInt()
+      for (y in 0 until n) {
+        for (x in 0 until n) {
+          val gx = col * n + x
+          val gy = row * n + y
+          var drawFg = false
+          val cx = x - n / 2
+          val cy = y - n / 2
+          when (piece.lowercaseChar()) {
+            'p' -> drawFg = cx * cx + cy * cy <= 64
+            'r' -> drawFg = kotlin.math.abs(cx) <= 8 && kotlin.math.abs(cy) <= 11
+            'n' -> drawFg = kotlin.math.abs(cx) <= 10 && kotlin.math.abs(cy) <= 10 && cx + cy <= 8
+            'b' -> drawFg = kotlin.math.abs(cx) * 2 + kotlin.math.abs(cy) <= 22
+            'q' -> drawFg = (cx * cx + cy * cy <= 144) && !(kotlin.math.abs(cx) <= 3 && cy < -8)
+            'k' -> drawFg = kotlin.math.abs(cx) <= 12 && kotlin.math.abs(cy) <= 12
+          }
+          px[gy * com.example.chessreviewer.Vision.B + gx] = if (drawFg) fg else bg
+        }
+      }
+    }
+
+    for (r in 0 until 8) {
+      for (c in 0 until 8) {
+        drawSquare(r, c, startPos[r][c])
+      }
+    }
+
+    val learnResult = com.example.chessreviewer.Vision.learn(px)
+    assertNotNull("Expected learn() to succeed: ${learnResult.error}", learnResult.templates)
+    assertTrue(learnResult.whiteBottom)
+
+    val serialized = learnResult.templates!!.serialize()
+    val parsed = com.example.chessreviewer.Templates.parse(serialized)
+    assertNotNull(parsed)
+
+    val readStart = com.example.chessreviewer.Vision.readPosition(px, parsed!!, whiteAtBottom = true)
+    assertNotNull(readStart)
+    assertEquals(com.example.chessreviewer.Chess.START, com.example.chessreviewer.Chess.placement(readStart!!))
+
+    val tracker = com.example.chessreviewer.Tracker()
+    tracker.update(readStart, whiteAtBottom = true)
+    assertEquals(
+      "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+      tracker.fen(readStart),
+    )
+
+    // Simulate 1. e4 visually (clear e2 at row 6 col 4, draw 'P' on e4 at row 4 col 4)
+    drawSquare(6, 4, '.')
+    drawSquare(4, 4, 'P')
+    val afterE4 = com.example.chessreviewer.Vision.readPosition(px, parsed, whiteAtBottom = true)
+    assertNotNull(afterE4)
+    tracker.update(afterE4!!, whiteAtBottom = true)
+    assertTrue(tracker.blackToMove)
+    assertEquals(
+      "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1",
+      tracker.fen(afterE4),
+    )
+  }
 }

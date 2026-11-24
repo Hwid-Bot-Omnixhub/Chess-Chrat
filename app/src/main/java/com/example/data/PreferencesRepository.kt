@@ -37,6 +37,9 @@ data class UserPreferences(
   val overlayBoardSizePx: Int = 780,
   val statsHudX: Int = 36,
   val statsHudY: Int = 1080,
+  val visionTemplates: String? = null,
+  val visionWhiteBottom: Boolean = true,
+  val autoBoardScan: Boolean = false,
 )
 
 class PreferencesRepository(private val context: Context) {
@@ -59,6 +62,9 @@ class PreferencesRepository(private val context: Context) {
     val OVERLAY_BOARD_SIZE = intPreferencesKey("overlay_board_size")
     val STATS_HUD_X = intPreferencesKey("stats_hud_x")
     val STATS_HUD_Y = intPreferencesKey("stats_hud_y")
+    val VISION_TEMPLATES = stringPreferencesKey("vision_templates")
+    val VISION_WHITE_BOTTOM = booleanPreferencesKey("vision_white_bottom")
+    val AUTO_BOARD_SCAN = booleanPreferencesKey("auto_board_scan")
   }
 
   val preferencesFlow: Flow<UserPreferences> =
@@ -95,6 +101,9 @@ class PreferencesRepository(private val context: Context) {
         overlayBoardSizePx = prefs[Keys.OVERLAY_BOARD_SIZE] ?: 780,
         statsHudX = prefs[Keys.STATS_HUD_X] ?: 36,
         statsHudY = prefs[Keys.STATS_HUD_Y] ?: 1080,
+        visionTemplates = prefs[Keys.VISION_TEMPLATES],
+        visionWhiteBottom = prefs[Keys.VISION_WHITE_BOTTOM] ?: true,
+        autoBoardScan = prefs[Keys.AUTO_BOARD_SCAN] ?: false,
       )
     }
 
@@ -161,5 +170,16 @@ class PreferencesRepository(private val context: Context) {
       it[Keys.STATS_HUD_X] = x
       it[Keys.STATS_HUD_Y] = y
     }
+  }
+
+  suspend fun saveVisionTemplates(serialized: String, whiteBottom: Boolean) {
+    context.dataStore.edit {
+      it[Keys.VISION_TEMPLATES] = serialized
+      it[Keys.VISION_WHITE_BOTTOM] = whiteBottom
+    }
+  }
+
+  suspend fun updateAutoBoardScan(enabled: Boolean) {
+    context.dataStore.edit { it[Keys.AUTO_BOARD_SCAN] = enabled }
   }
 }

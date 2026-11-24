@@ -1,6 +1,8 @@
 package com.example.ui.screens
 
 import android.Manifest
+import android.content.Context
+import android.media.projection.MediaProjectionManager
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -24,10 +26,12 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
+import androidx.compose.material.icons.filled.CenterFocusStrong
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.NotificationsActive
 import androidx.compose.material.icons.filled.Radar
+import androidx.compose.material.icons.filled.Screenshot
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.Warning
@@ -84,6 +88,11 @@ fun WatcherScreen(
   val settingsLauncher =
     rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
       viewModel.refreshSystemStatus()
+    }
+
+  val projectionLauncher =
+    rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
+      viewModel.onMediaProjectionResult(res.resultCode, res.data)
     }
 
   Column(
@@ -145,12 +154,12 @@ fun WatcherScreen(
           )
         }
         Text(
-          text = "Live Chess App Watcher & Arrow HUD",
+          text = "Live Chess App Watcher & Board Checker",
           style = MaterialTheme.typography.titleLarge,
           color = Color.White,
         )
         Text(
-          text = "Auto-detects official chess apps and floats pass-through tactical arrows.",
+          text = "Touch-through arrows + non-root Shizuku & MediaProjection board scanner.",
           style = MaterialTheme.typography.bodyMedium,
           color = Color(0xFFD0D7DE),
         )
@@ -177,15 +186,22 @@ fun WatcherScreen(
             Text(
               text =
                 if (shared.overlayServiceRunning) {
-                  "HUD is floating. Drag the 8×8 frame over your board, tap Sync to input moves, and tap Lock for touch-through."
+                  "Touch-through is ${if (shared.overlayPassThrough) "ON (real game is touchable)" else "OFF (Align mode active)"}. Tap Align / Done in the floating toolbar anytime."
                 } else {
-                  "Launch the floating arrow HUD to overlay best moves over Chess.com, Lichess, or practice boards."
+                  "Starts with touch-through ON so you can play your chess app uninterrupted."
                 },
               style = MaterialTheme.typography.bodyMedium,
               color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
           }
         }
+
+        ToggleSettingRow(
+          title = "Touch-Through Mode (Real Game Stays Touchable)",
+          checked = shared.overlayPassThrough,
+          onCheckedChange = viewModel::setOverlayPassThrough,
+          tag = "overlay_passthrough_switch",
+        )
 
         Button(
           onClick = { viewModel.toggleOverlayService() },
@@ -210,6 +226,124 @@ fun WatcherScreen(
               else "Start Floating Arrow Overlay",
             style = MaterialTheme.typography.labelLarge,
           )
+        }
+      }
+    }
+
+    // Non-Root Board Checker & Capture Card (Shizuku + MediaProjection + Vision)
+    Card(
+      colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+      border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+      shape = RoundedCornerShape(16.dp),
+    ) {
+      Column(
+        modifier = Modifier.fillMaxWidth().padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+      ) {
+        Row(
+          modifier = Modifier.fillMaxWidth(),
+          horizontalArrangement = Arrangement.SpaceBetween,
+          verticalAlignment = Alignment.CenterVertically,
+        ) {
+          Text(
+            text = "BOARD CHECKER (NO ROOT)",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+          )
+          Surface(
+            color =
+              if (shared.visionTemplatesReady) TacticalEmerald.copy(alpha = 0.16f)
+              else AmberGold.copy(alpha = 0.16f),
+            shape = RoundedCornerShape(8.dp),
+          ) {
+            Text(
+              text = if (shared.visionTemplatesReady) "Theme Learned" else "Needs Learn",
+              style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+              color = if (shared.visionTemplatesReady) TacticalEmerald else AmberGold,
+              modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+            )
+          }
+        }
+
+        Text(
+          text = shared.boardCheckerStatus,
+          style = MaterialTheme.typography.bodyMedium,
+          color = ElectricCyan,
+        )
+
+        // Shizuku Non-Root Row
+        PermissionRow(
+          title = "Shizuku Capture (Non-Root ADB / Wireless)",
+          subtitle =
+            when {
+              shared.shizukuReady -> "Connected (uid 2000 shell) — works on protected screens"
+              shared.shizukuRunning -> "Shizuku is running — grant permission to enable"
+              else -> "Optional: reads FLAG_SECURE boards without root via Shizuku"
+            },
+          granted = shared.shizukuReady,
+          actionLabel = if (shared.shizukuRunning) "Grant" else "Setup",
+          icon = Icons.Default.Security,
+          buttonTag = "grant_shizuku_button",
+          onGrant = { viewModel.requestShizukuPermission() },
+        )
+
+        HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.5f))
+
+        // Standard MediaProjection Non-Root Row
+        PermissionRow(
+          title = "Standard Screen Capture (No Root / No Shizuku)",
+          subtitle =
+            if (shared.mediaProjectionReady) "MediaProjection active for visual board scanning"
+            else "Built-in Android screen capture for unrooted devices",
+          granted = shared.mediaProjectionReady,
+          actionLabel = "Enable",
+          icon = Icons.Default.Screenshot,
+          buttonTag = "enable_projection_button",
+          onGrant = {
+            val mgr = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            projectionLauncher.launch(mgr.createScreenCaptureIntent())
+          },
+        )
+
+        HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.5f))
+
+        ToggleSettingRow(
+          title = "Auto-Scan Board Moves (Hands-Free Arrow Sync)",
+          checked = shared.autoBoardScanEnabled,
+          onCheckedChange = viewModel::setAutoBoardScan,
+          tag = "auto_scan_switch",
+        )
+
+        Row(
+          modifier = Modifier.fillMaxWidth(),
+          horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+          OutlinedButton(
+            onClick = { viewModel.learnBoardFromScreen() },
+            shape = RoundedCornerShape(10.dp),
+            modifier = Modifier.weight(1f).height(48.dp).testTag("learn_board_button"),
+          ) {
+            Icon(
+              imageVector = Icons.Default.CenterFocusStrong,
+              contentDescription = null,
+              modifier = Modifier.size(18.dp),
+            )
+            Spacer(modifier = Modifier.width(6.dp))
+            Text("Learn Start")
+          }
+
+          Button(
+            onClick = { viewModel.scanBoardOnce() },
+            colors =
+              ButtonDefaults.buttonColors(
+                containerColor = ElectricCyan,
+                contentColor = Color(0xFF0D1117),
+              ),
+            shape = RoundedCornerShape(10.dp),
+            modifier = Modifier.weight(1f).height(48.dp).testTag("scan_board_button"),
+          ) {
+            Text("Check Board")
+          }
         }
       }
     }
@@ -330,7 +464,9 @@ fun WatcherScreen(
         )
 
         ToggleSettingRow(
-          title = "Use Stockfish Online API (Up to Depth 15)",
+          title =
+            if (uiState.isNativeStockfishAvailable) "Use Stockfish (Native Binary + Online API)"
+            else "Use Stockfish Online API (Up to Depth 15)",
           checked = shared.useStockfishApi,
           onCheckedChange = viewModel::setUseStockfishApi,
           tag = "watcher_stockfish_switch",
@@ -446,6 +582,7 @@ private fun PermissionRow(
   granted: Boolean,
   icon: androidx.compose.ui.graphics.vector.ImageVector,
   buttonTag: String,
+  actionLabel: String = "Grant",
   onGrant: () -> Unit,
 ) {
   Row(
@@ -493,7 +630,7 @@ private fun PermissionRow(
           modifier = Modifier.size(16.dp),
         )
         Spacer(modifier = Modifier.width(4.dp))
-        Text("Grant")
+        Text(actionLabel)
       }
     }
   }

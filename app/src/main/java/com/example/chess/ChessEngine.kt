@@ -1,5 +1,7 @@
 package com.example.chess
 
+import android.content.Context
+import com.example.chessreviewer.StockfishEngine
 import kotlin.coroutines.coroutineContext
 import kotlin.math.abs
 import kotlinx.coroutines.Dispatchers
@@ -11,6 +13,19 @@ object ChessEngine {
   private const val MATE_SCORE = 50_000
   private const val INF = 1_000_000
   private const val MAX_CACHE_SIZE = 128
+
+  @Volatile
+  private var nativeEngine: StockfishEngine? = null
+
+  fun initNativeEngine(context: Context) {
+    if (nativeEngine != null) return
+    val eng = StockfishEngine(context.applicationContext)
+    if (eng.available()) {
+      nativeEngine = eng
+    }
+  }
+
+  fun isNativeStockfishAvailable(): Boolean = nativeEngine?.available() == true
 
   private enum class TTFlag {
     EXACT,
@@ -332,7 +347,76 @@ object ChessEngine {
 
     onQuickPreview?.invoke(quickLocal)
 
-    // Stage 2: Stockfish Online API (depth 1..15) or deeper local search
+    // Stage 2: Native Stockfish UCI (if libstockfish.so bundled) -> Stockfish Online API (depth 1..15)
+    val native = nativeEngine
+    if (useStockfishApi && native != null && native.available()) {
+      val nativeElo = if (clampedElo >= 3190) null else clampedElo.coerceIn(600, 3190)
+      val moveTimeMs = (sfDepth * 65).coerceIn(120, if (antiLagEnabled) 650 else 1100)
+      val nativeResult =
+        withContext(Dispatchers.IO) {
+          native.setElo(nativeElo)
+          native.analyze(fen, moveTimeMs)
+        }
+      coroutineContext.ensureActive()
+
+      if (nativeResult != null && nativeResult.best.length >= 4) {
+        val matched = legalMoves.find { it.uci.equals(nativeResult.best, ignoreCase = true) }
+        if (matched != null) {
+          val san = ChessRules.toSan(board, matched, legalMoves)
+          val whiteCp =
+            when {
+              nativeResult.mate != null -> {
+                val m = nativeResult.mate
+                val sign = if (board.sideToMove == PieceColor.WHITE) 1 else -1
+                if (m > 0) sign * (50_000 - m * 10) else -sign * (50_000 + m * 10)
+              }
+              nativeResult.cp != null ->
+                if (board.sideToMove == PieceColor.WHITE) nativeResult.cp else -nativeResult.cp
+              else -> quickLocal.evalCp
+            }
+          val mateAbs = nativeResult.mate?.let { kotlin.math.abs(it) }
+          val display = formatScore(whiteCp, mateAbs, board.sideToMove)
+          val pv = buildPrincipalVariation(board, matched, maxPlies = 4)
+          val tag = classifyMove(board, matched, san, mateAbs, true, opening?.preferredUcis)
+          val mergedTop =
+            buildList {
+              add(
+                SuggestedMove(
+                  rank = 1,
+                  move = matched,
+                  san = san,
+                  scoreCp = whiteCp,
+                  mateIn = mateAbs,
+                  scoreDisplay = display,
+                  pvLine = pv,
+                  tacticalTag = tag,
+                ),
+              )
+              addAll(
+                quickLocal.topMoves
+                  .filter { it.move.uci != matched.uci }
+                  .take(2)
+                  .mapIndexed { idx, m -> m.copy(rank = idx + 2) },
+              )
+            }
+          val elapsedMs = ((System.nanoTime() - totalStartNs) / 1_000_000L).coerceAtLeast(1L)
+          val combined =
+            quickLocal.copy(
+              evalCp = whiteCp,
+              mateIn = mateAbs,
+              scoreDisplay = display,
+              topMoves = mergedTop,
+              depthReached = sfDepth,
+              engineSource = "Stockfish Native",
+              analysisTimeMs = elapsedMs,
+              targetElo = clampedElo,
+            )
+          putCached(cacheKey, combined)
+          return combined
+        }
+      }
+    }
+
     if (useStockfishApi) {
       val sfResult =
         withContext(Dispatchers.IO) {

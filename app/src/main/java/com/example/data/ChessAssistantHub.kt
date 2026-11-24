@@ -52,7 +52,7 @@ data class AssistantSharedState(
     setOf("com.chess", "org.lichess.mobileapp", "com.chess24.app", "uk.co.aifactory.chessfree"),
   val overlayServiceRunning: Boolean = false,
   val overlayGridVisible: Boolean = true,
-  val overlayPassThrough: Boolean = false,
+  val overlayPassThrough: Boolean = true,
   val overlayTapSyncActive: Boolean = false,
   val detectedForegroundApp: WatchedChessApp? = null,
   val activeLabel: String? = null,
@@ -61,6 +61,13 @@ data class AssistantSharedState(
   val overlayBoardSizePx: Int = 780,
   val statsHudX: Int = 36,
   val statsHudY: Int = 1080,
+  val autoBoardScanEnabled: Boolean = false,
+  val visionTemplatesReady: Boolean = false,
+  val visionWhiteBottom: Boolean = true,
+  val boardCheckerStatus: String = "Align frame over board & tap Learn on starting position",
+  val shizukuRunning: Boolean = false,
+  val shizukuReady: Boolean = false,
+  val mediaProjectionReady: Boolean = false,
 )
 
 object ChessAssistantHub {
@@ -114,6 +121,9 @@ object ChessAssistantHub {
         overlayBoardSizePx = prefs.overlayBoardSizePx,
         statsHudX = prefs.statsHudX,
         statsHudY = prefs.statsHudY,
+        visionTemplatesReady = !prefs.visionTemplates.isNullOrBlank(),
+        visionWhiteBottom = prefs.visionWhiteBottom,
+        autoBoardScanEnabled = prefs.autoBoardScan,
       )
     }
     if (shouldReanalyze) triggerAnalysis(debounceMs = 0L)
@@ -395,6 +405,86 @@ object ChessAssistantHub {
 
   fun updateStatsHudPosition(x: Int, y: Int) {
     _state.update { it.copy(statsHudX = x, statsHudY = y) }
+  }
+
+  fun setAutoBoardScan(enabled: Boolean) {
+    _state.update { it.copy(autoBoardScanEnabled = enabled) }
+  }
+
+  fun setVisionLearned(whiteBottom: Boolean, status: String) {
+    _state.update {
+      it.copy(
+        visionTemplatesReady = true,
+        visionWhiteBottom = whiteBottom,
+        flippedBoard = !whiteBottom,
+        boardCheckerStatus = status,
+      )
+    }
+  }
+
+  fun setBoardCheckerStatus(status: String) {
+    _state.update { it.copy(boardCheckerStatus = status) }
+  }
+
+  fun setCaptureReadiness(
+    shizukuRunning: Boolean = _state.value.shizukuRunning,
+    shizukuReady: Boolean = _state.value.shizukuReady,
+    mediaProjectionReady: Boolean = _state.value.mediaProjectionReady,
+  ) {
+    _state.update {
+      it.copy(
+        shizukuRunning = shizukuRunning,
+        shizukuReady = shizukuReady,
+        mediaProjectionReady = mediaProjectionReady,
+      )
+    }
+  }
+
+  /**
+   * Applies a visually scanned board position. If a single legal move from the current position
+   * produces the scanned piece placement, it plays that move so Move Grades (!!, !, ✓) update live.
+   */
+  fun applyScannedBoard(fullFen: String, whiteBottom: Boolean): Boolean {
+    val scannedPlacement = fullFen.substringBefore(' ')
+    val current = _state.value.board
+    val currentPlacement = current.toFen().substringBefore(' ')
+    if (currentPlacement == scannedPlacement) {
+      _state.update {
+        it.copy(
+          flippedBoard = !whiteBottom,
+          boardCheckerStatus = "Board verified (${if (current.sideToMove == PieceColor.WHITE) "White" else "Black"} to move)",
+        )
+      }
+      return false
+    }
+
+    val legal = ChessRules.generateLegalMoves(current)
+    val matchingMove =
+      legal.firstOrNull { move ->
+        (move.promotion == null || move.promotion == PieceType.QUEEN) &&
+          ChessRules.applyMove(current, move).toFen().substringBefore(' ') == scannedPlacement
+      }
+
+    if (matchingMove != null) {
+      _state.update {
+        it.copy(
+          flippedBoard = !whiteBottom,
+          boardCheckerStatus = "Move detected & synced",
+        )
+      }
+      return playMove(matchingMove)
+    }
+
+    val loaded = loadFen(fullFen, "Board Checker")
+    if (loaded) {
+      _state.update {
+        it.copy(
+          flippedBoard = !whiteBottom,
+          boardCheckerStatus = "Position synced from screen",
+        )
+      }
+    }
+    return loaded
   }
 
   private fun maybeTriggerEngineReply() {

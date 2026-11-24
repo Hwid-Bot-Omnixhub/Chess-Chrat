@@ -1,16 +1,20 @@
 package com.example.ui
 
+import android.app.Activity
 import android.app.Application
+import android.content.Intent
+import android.content.pm.PackageManager
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.chess.ChessEngine
 import com.example.chess.ChessRules
-import com.example.chess.Move
 import com.example.chess.OpeningLine
 import com.example.chess.PieceColor
 import com.example.chess.PieceType
 import com.example.chess.Square
 import com.example.chess.SuggestedMove
 import com.example.chess.TacticalPuzzle
+import com.example.chessreviewer.ShizukuCapture
 import com.example.data.AssistantSharedState
 import com.example.data.BoardInteractionMode
 import com.example.data.ChessAppRegistry
@@ -19,6 +23,7 @@ import com.example.data.InstalledChessAppStatus
 import com.example.data.PreferencesRepository
 import com.example.data.SystemAccessHelper
 import com.example.data.SystemPermissionsState
+import com.example.service.BoardVisionScanner
 import com.example.service.ChessOverlayService
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -26,6 +31,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import rikka.shizuku.Shizuku
 
 data class KnightSightUiState(
   val shared: AssistantSharedState = AssistantSharedState(),
@@ -35,6 +41,7 @@ data class KnightSightUiState(
   val legalDestinations: Set<Square> = emptySet(),
   val pendingPromotion: Pair<Square, Square>? = null,
   val statusMessage: String? = null,
+  val isNativeStockfishAvailable: Boolean = false,
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -43,9 +50,46 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
   private val _uiState = MutableStateFlow(KnightSightUiState())
   val uiState: StateFlow<KnightSightUiState> = _uiState.asStateFlow()
 
+  private val shizukuPermissionListener =
+    Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
+      if (requestCode == ShizukuCapture.SHIZUKU_PERMISSION_REQUEST_CODE) {
+        BoardVisionScanner.refreshReadiness(getApplication())
+        val granted = grantResult == PackageManager.PERMISSION_GRANTED
+        _uiState.update {
+          it.copy(
+            statusMessage =
+              if (granted) "Shizuku access granted (non-root ready)"
+              else "Shizuku permission denied — you can still use Standard Screen Capture",
+          )
+        }
+      }
+    }
+
+  private val shizukuBinderListener =
+    Shizuku.OnBinderReceivedListener {
+      BoardVisionScanner.refreshReadiness(getApplication())
+    }
+
+  private val shizukuDeadListener =
+    Shizuku.OnBinderDeadListener {
+      BoardVisionScanner.refreshReadiness(getApplication())
+    }
+
   init {
+    ChessEngine.initNativeEngine(application)
+    BoardVisionScanner.ensureInitialized(application)
+    runCatching {
+      Shizuku.addRequestPermissionResultListener(shizukuPermissionListener)
+      Shizuku.addBinderReceivedListenerSticky(shizukuBinderListener)
+      Shizuku.addBinderDeadListener(shizukuDeadListener)
+    }
+
     viewModelScope.launch {
       val initialPrefs = prefsRepo.preferencesFlow.first()
+      BoardVisionScanner.restoreSavedTemplates(
+        initialPrefs.visionTemplates,
+        initialPrefs.visionWhiteBottom,
+      )
       ChessAssistantHub.applyPreferences(initialPrefs)
       refreshSystemStatus()
     }
@@ -59,9 +103,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             selectedSquare = if (boardChanged) null else prev.selectedSquare,
             legalDestinations = if (boardChanged) emptySet() else prev.legalDestinations,
             pendingPromotion = if (boardChanged) null else prev.pendingPromotion,
+            isNativeStockfishAvailable = ChessEngine.isNativeStockfishAvailable(),
           )
         }
       }
+    }
+  }
+
+  override fun onCleared() {
+    super.onCleared()
+    runCatching {
+      Shizuku.removeRequestPermissionResultListener(shizukuPermissionListener)
+      Shizuku.removeBinderReceivedListener(shizukuBinderListener)
+      Shizuku.removeBinderDeadListener(shizukuDeadListener)
     }
   }
 
@@ -69,7 +123,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val ctx = getApplication<Application>()
     val perms = SystemAccessHelper.checkPermissions(ctx)
     val apps = ChessAppRegistry.getStatuses(ctx, ChessAssistantHub.state.value.watchedPackages)
-    _uiState.update { it.copy(permissions = perms, installedApps = apps) }
+    BoardVisionScanner.refreshReadiness(ctx)
+    _uiState.update {
+      it.copy(
+        permissions = perms,
+        installedApps = apps,
+        isNativeStockfishAvailable = ChessEngine.isNativeStockfishAvailable(),
+      )
+    }
   }
 
   fun onSquareTapped(square: Square) {
@@ -113,7 +174,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
       return
     }
 
-    // Re-select another friendly piece
     val movesFrom = ChessRules.generateLegalMoves(board).filter { it.from == square }
     if (movesFrom.isNotEmpty()) {
       _uiState.update {
@@ -227,6 +287,91 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     refreshSystemStatus()
   }
 
+  fun setOverlayPassThrough(passThrough: Boolean) {
+    val cur = ChessAssistantHub.state.value
+    ChessAssistantHub.setOverlayServiceState(
+      running = cur.overlayServiceRunning,
+      gridVisible = cur.overlayGridVisible,
+      passThrough = passThrough,
+      tapSync = if (passThrough) false else cur.overlayTapSyncActive,
+    )
+  }
+
+  fun requestShizukuPermission() {
+    val ctx = getApplication<Application>()
+    val requested = BoardVisionScanner.requestShizukuPermission(ctx)
+    if (!requested) {
+      val opened = SystemAccessHelper.launchApp(ctx, "moe.shizuku.privileged.api")
+      _uiState.update {
+        it.copy(
+          statusMessage =
+            if (opened) "Start Shizuku via Wireless Debugging, then return here"
+            else "Shizuku not running — use Enable Capture (No Root) instead",
+        )
+      }
+    }
+  }
+
+  fun onMediaProjectionResult(resultCode: Int, data: Intent?) {
+    val ctx = getApplication<Application>()
+    if (resultCode != Activity.RESULT_OK || data == null) {
+      _uiState.update { it.copy(statusMessage = "Screen capture permission cancelled") }
+      return
+    }
+    val perms = SystemAccessHelper.checkPermissions(ctx)
+    if (!perms.isOverlayReady) {
+      _uiState.update {
+        it.copy(statusMessage = "Grant Overlay & Notification permissions first")
+      }
+      return
+    }
+    ChessAssistantHub.setOverlayServiceState(
+      running = true,
+      gridVisible = true,
+      passThrough = true,
+      tapSync = false,
+    )
+    ChessOverlayService.startWithProjection(ctx, resultCode, data)
+    _uiState.update {
+      it.copy(statusMessage = "Non-root Screen Capture ready — Board Checker enabled")
+    }
+  }
+
+  fun learnBoardFromScreen() {
+    val ctx = getApplication<Application>()
+    if (_uiState.value.shared.overlayServiceRunning) {
+      ChessOverlayService.triggerLearn(ctx)
+      return
+    }
+    viewModelScope.launch {
+      val outcome = BoardVisionScanner.learnStartingBoard(ctx, prefsRepo)
+      _uiState.update { it.copy(statusMessage = outcome.message) }
+    }
+  }
+
+  fun scanBoardOnce() {
+    val ctx = getApplication<Application>()
+    if (_uiState.value.shared.overlayServiceRunning) {
+      ChessOverlayService.triggerScan(ctx)
+      return
+    }
+    viewModelScope.launch {
+      val outcome = BoardVisionScanner.scanBoardOnce(ctx, isAuto = false)
+      _uiState.update { it.copy(statusMessage = outcome.message) }
+    }
+  }
+
+  fun setAutoBoardScan(enabled: Boolean) {
+    if (enabled && !_uiState.value.shared.visionTemplatesReady) {
+      _uiState.update {
+        it.copy(statusMessage = "Tap Learn on a starting chess board first")
+      }
+      return
+    }
+    ChessAssistantHub.setAutoBoardScan(enabled)
+    viewModelScope.launch { prefsRepo.updateAutoBoardScan(enabled) }
+  }
+
   fun importFenOrPgn(rawInput: String): Boolean {
     val trimmed = rawInput.trim()
     val loaded =
@@ -279,14 +424,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
       ChessOverlayService.stop(ctx)
       _uiState.update { it.copy(statusMessage = "Floating Arrow Overlay stopped") }
     } else {
+      // Touch-through ON by default so the real chess game underneath stays 100% playable!
       ChessAssistantHub.setOverlayServiceState(
         running = true,
         gridVisible = true,
-        passThrough = false,
+        passThrough = true,
+        tapSync = false,
       )
       ChessOverlayService.start(ctx)
       _uiState.update {
-        it.copy(statusMessage = "Floating Arrow Overlay launched — drag over your board")
+        it.copy(
+          statusMessage =
+            "Overlay started (touch-through ON — tap Align in the floating bar to position frame)",
+        )
       }
     }
     return true
@@ -296,7 +446,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val ctx = getApplication<Application>()
     val perms = SystemAccessHelper.checkPermissions(ctx)
     if (perms.isOverlayReady && !_uiState.value.shared.overlayServiceRunning) {
-      ChessAssistantHub.setOverlayServiceState(running = true, gridVisible = true)
+      ChessAssistantHub.setOverlayServiceState(
+        running = true,
+        gridVisible = true,
+        passThrough = true,
+        tapSync = false,
+      )
       ChessOverlayService.start(ctx)
     }
     val launched = SystemAccessHelper.launchApp(ctx, packageName)
