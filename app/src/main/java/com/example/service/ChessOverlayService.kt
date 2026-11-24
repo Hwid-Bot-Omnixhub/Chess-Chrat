@@ -221,7 +221,7 @@ class ChessOverlayService : Service() {
   }
 
   private fun runLearnFromService() {
-    serviceScope.launch {
+    serviceScope.launch(Dispatchers.Default) {
       val outcome =
         BoardVisionScanner.learnStartingBoard(
           context = applicationContext,
@@ -235,7 +235,7 @@ class ChessOverlayService : Service() {
   }
 
   private fun runScanOnceFromService(isAuto: Boolean = false) {
-    serviceScope.launch {
+    serviceScope.launch(Dispatchers.Default) {
       val outcome =
         BoardVisionScanner.scanBoardOnce(
           context = applicationContext,
@@ -490,16 +490,22 @@ class ChessOverlayService : Service() {
     boardScannerJob =
       serviceScope.launch(Dispatchers.Default) {
         while (isActive) {
+          BoardVisionScanner.refreshReadiness(applicationContext)
           val st = ChessAssistantHub.state.value
-          if (st.autoBoardScanEnabled &&
-            BoardVisionScanner.isCaptureAvailable(applicationContext)
-          ) {
-            BoardVisionScanner.scanBoardOnce(
-              context = applicationContext,
-              prefsRepo = prefsRepo,
-              isAuto = true,
-              pulseHideOverlay = ::setOverlayHiddenForCapture,
-            )
+          if (st.autoBoardScanEnabled) {
+            if (BoardVisionScanner.isCaptureAvailable(applicationContext)) {
+              BoardVisionScanner.scanBoardOnce(
+                context = applicationContext,
+                prefsRepo = prefsRepo,
+                isAuto = true,
+                pulseHideOverlay = ::setOverlayHiddenForCapture,
+              )
+            } else {
+              ChessAssistantHub.setBoardCheckerStatus(
+                if (st.shizukuRunning) "Grant Shizuku permission or enable Screen Capture"
+                else "Enable Screen Capture (No Root) or start Shizuku",
+              )
+            }
           }
           delay(BoardVisionScanner.recommendedLoopDelayMs(st.antiLagEnabled))
         }

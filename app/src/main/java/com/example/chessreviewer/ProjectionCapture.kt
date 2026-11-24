@@ -96,10 +96,12 @@ class ProjectionCapture {
 
     fun grab(waitAfterSeq: Long = -1L, waitForFreshMs: Long = 0L): Bitmap? {
         if (!isActive) return null
-        if (waitAfterSeq >= 0L && waitForFreshMs > 0L) {
-            val deadline = android.os.SystemClock.uptimeMillis() + waitForFreshMs
+        val targetSeq = if (waitAfterSeq >= 0L) waitAfterSeq else if (frameSequence == 0L) 0L else -1L
+        val effectiveWaitMs = if (waitAfterSeq >= 0L) waitForFreshMs else if (frameSequence == 0L) maxOf(waitForFreshMs, 300L) else 0L
+        if (targetSeq >= 0L && effectiveWaitMs > 0L) {
+            val deadline = android.os.SystemClock.uptimeMillis() + effectiveWaitMs
             synchronized(frameSignal) {
-                while (isActive && frameSequence <= waitAfterSeq) {
+                while (isActive && frameSequence <= targetSeq) {
                     val remaining = deadline - android.os.SystemClock.uptimeMillis()
                     if (remaining <= 0L) break
                     try {

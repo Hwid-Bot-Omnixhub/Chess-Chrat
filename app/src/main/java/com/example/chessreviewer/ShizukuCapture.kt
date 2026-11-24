@@ -95,14 +95,23 @@ class ShizukuCapture(private val appContext: Context) {
 
     fun isBound(): Boolean = service?.let { runCatching { it.asBinder().pingBinder() }.getOrDefault(false) } == true
 
+    @Volatile
+    private var hasAttemptedBind: Boolean = false
+
     /** Pre-warms the Shizuku UserService connection asynchronously without blocking any caller. */
     fun warmUpAsync() {
         if (!ready() || isBound()) return
         val now = SystemClock.uptimeMillis()
-        if (bindInFlight || now < nextBindAttemptAtMs) return
+        if (bindInFlight || (hasAttemptedBind && now < nextBindAttemptAtMs)) return
         synchronized(bindLock) {
-            if (isBound() || bindInFlight || SystemClock.uptimeMillis() < nextBindAttemptAtMs) return
+            if (isBound() || bindInFlight || (hasAttemptedBind && SystemClock.uptimeMillis() < nextBindAttemptAtMs)) {
+                return
+            }
+            hasAttemptedBind = true
             bindInFlight = true
+            if (latch == null || latch?.count == 0L) {
+                latch = CountDownLatch(1)
+            }
             mainHandler.post {
                 try {
                     Shizuku.bindUserService(userServiceArgs, connection)
@@ -142,7 +151,7 @@ class ShizukuCapture(private val appContext: Context) {
         }
     }
 
-    fun bindService(timeoutMs: Long = 3_500L): ISecureShot? {
+    fun bindService(timeoutMs: Long = 5_000L): ISecureShot? {
         if (!ready()) {
             lastError = if (isRunning()) "Shizuku permission not granted" else "Shizuku is not running"
             return null
@@ -191,7 +200,7 @@ class ShizukuCapture(private val appContext: Context) {
         }
     }
 
-    fun grab(width: Int = 0, height: Int = 0, timeoutMs: Long = 3_500L): Bitmap? {
+    fun grab(width: Int = 0, height: Int = 0, timeoutMs: Long = 5_000L): Bitmap? {
         val svc = bindService(timeoutMs) ?: return null
         return decodeFromSecureShot(svc, width, height)
     }
@@ -204,7 +213,7 @@ class ShizukuCapture(private val appContext: Context) {
         service = null
 
         val now = SystemClock.uptimeMillis()
-        if (now < nextBindAttemptAtMs) {
+        if (hasAttemptedBind && now < nextBindAttemptAtMs) {
             return null
         }
 
@@ -223,6 +232,7 @@ class ShizukuCapture(private val appContext: Context) {
                 latch = it
             }
             if (!bindInFlight) {
+                hasAttemptedBind = true
                 bindInFlight = true
                 mainHandler.post {
                     try {
@@ -268,6 +278,6 @@ class ShizukuCapture(private val appContext: Context) {
     companion object {
         const val SHIZUKU_PERMISSION_REQUEST_CODE = 4201
         private const val CHUNK_SIZE = 256 * 1024
-        private const val BIND_RETRY_COOLDOWN_MS = 8_000L
+        private const val BIND_RETRY_COOLDOWN_MS = 1_200L
     }
 }

@@ -18,8 +18,11 @@ import com.example.data.ChessAssistantHub
 import com.example.data.PreferencesRepository
 import kotlin.math.abs
 import kotlin.math.roundToInt
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -32,6 +35,7 @@ import kotlinx.coroutines.withContext
 object BoardVisionScanner {
 
   private val scanMutex = Mutex()
+  private val scannerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
   @Volatile
   private var secureCapture: SecureCapture? = null
@@ -94,7 +98,9 @@ object BoardVisionScanner {
     val sc = ensureInitialized(context)
     val shizukuReady = sc.shizuku.ready()
     if (shizukuReady && !sc.shizuku.isBound()) {
-      sc.shizuku.warmUpAsync()
+      scannerScope.launch {
+        sc.shizuku.bindService(timeoutMs = 5_000L)
+      }
     }
     ChessAssistantHub.setCaptureReadiness(
       shizukuInstalled = sc.shizuku.isAppInstalled(),
@@ -145,7 +151,11 @@ object BoardVisionScanner {
 
   fun isCaptureAvailable(context: Context): Boolean {
     val sc = ensureInitialized(context)
-    return sc.shizuku.ready() || projectionCapture.isActive || sc.mode == SecureCapture.Mode.ROOT
+    return sc.shizuku.ready() ||
+      sc.shizuku.isBound() ||
+      projectionCapture.isActive ||
+      sc.mode == SecureCapture.Mode.ROOT ||
+      sc.mode == SecureCapture.Mode.SHIZUKU
   }
 
   data class ScanOutcome(val success: Boolean, val message: String)
@@ -224,7 +234,8 @@ object BoardVisionScanner {
       val appCtx = context.applicationContext
       val captured = captureAndFindBoard(appCtx, pulseHideOverlay)
       if (captured.unchangedFrame) {
-        unchangedStreak = (unchangedStreak + 1).coerceAtMost(100)
+        val visible = ChessAssistantHub.state.value.isBoardVisibleOnScreen
+        unchangedStreak = if (visible) (unchangedStreak + 1).coerceAtMost(100) else 0
         return@withLock ScanOutcome(true, "Board unchanged")
       }
 
@@ -469,7 +480,12 @@ object BoardVisionScanner {
 
     return try {
       withContext(Dispatchers.IO) {
-        val shot = if (sc.shizuku.ready()) sc.shizuku.bindService(2_500L) else null
+        val shot =
+          if (sc.shizuku.ready()) {
+            sc.shizuku.bindService(if (sc.shizuku.isBound()) 2_500L else 5_000L)
+          } else {
+            null
+          }
         if (shot != null) {
           val res = BoardFinder.findFromSecureShot(shot)
           if (res.frame != null) {

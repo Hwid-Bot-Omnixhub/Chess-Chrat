@@ -26,15 +26,17 @@ class SecureCapture(context: Context, cacheDir: File) {
     val shizuku = ShizukuCapture(context.applicationContext)
 
     @Volatile private var retryAfter = 0L
+    @Volatile private var attemptedOnce = false
 
     /** Non-root first: prefers Shizuku whenever ready so unrooted phones never stall on `su`. */
     fun grab(width: Int = 0, height: Int = 0): Bitmap? {
         val now = SystemClock.uptimeMillis()
-        if (now < retryAfter) return null
+        if (attemptedOnce && now < retryAfter) return null
+        attemptedOnce = true
 
         // Prioritize Shizuku (non-root ADB / Wireless Debugging) whenever ready or already active
         if (mode == Mode.SHIZUKU || shizuku.ready()) {
-            val fromShizuku = shizuku.grab(width, height, if (mode == Mode.UNKNOWN) 6_000L else 3_500L)
+            val fromShizuku = shizuku.grab(width, height, if (mode == Mode.UNKNOWN) 5_000L else 3_000L)
             if (fromShizuku != null) {
                 mode = Mode.SHIZUKU
                 lastError = ""
@@ -51,17 +53,6 @@ class SecureCapture(context: Context, cacheDir: File) {
                 lastError = ""
                 retryAfter = 0L
                 return fromRoot
-            }
-        }
-
-        // Last check in case Shizuku became ready mid-call
-        if (shizuku.ready()) {
-            val retryShizuku = shizuku.grab(width, height, 4_000L)
-            if (retryShizuku != null) {
-                mode = Mode.SHIZUKU
-                lastError = ""
-                retryAfter = 0L
-                return retryShizuku
             }
         }
 
@@ -84,7 +75,7 @@ class SecureCapture(context: Context, cacheDir: File) {
     }
 
     companion object {
-        private const val RETRY_MS = 3_500L
+        private const val RETRY_MS = 1_200L
     }
 }
 
