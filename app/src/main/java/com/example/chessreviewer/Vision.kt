@@ -155,8 +155,8 @@ object Vision {
             if (expected && !seen) missing.add(i)
             if (!expected && seen) extra.add(i)
         }
-        // a couple of odd squares are tolerated (e.g. one highlighted or selected piece)
-        if (missing.size + extra.size > 2) {
+        // at most 1 noisy/selected starting square is tolerated; 1 missing + 1 extra (= 2) means a move was already played
+        if (missing.size + extra.size > 1) {
             fun lbl(list: List<Int>): String =
                 list.take(6).joinToString(", ") { "col ${it % 8 + 1}/row ${it / 8 + 1}" }
             var msg = "Start position not recognised."
@@ -226,9 +226,8 @@ object Vision {
         return LearnResult(Templates(tpl, (whiteLum + blackLum) / 2f, occ), whiteBottom, null)
     }
 
-    private fun classify(s: Sq, t: Templates): Char {
-        var best = 0
-        var bd = Float.MAX_VALUE
+    private fun distances(s: Sq, t: Templates): FloatArray {
+        val out = FloatArray(6)
         for (i in 0 until 6) {
             val tp = t.tpl[i]
             var d = 0f
@@ -236,29 +235,96 @@ object Vision {
                 val e = s.feat[j] - tp[j]
                 d += e * e
             }
-            if (d < bd) { bd = d; best = i }
+            out[i] = d
         }
-        val ch = "pnbrqk"[best]
-        return if (s.lum > t.lumThreshold) ch.uppercaseChar() else ch
+        return out
+    }
+
+    private fun bestClassIn(dists: FloatArray, range: IntRange): Int {
+        var best = range.first
+        var bd = Float.MAX_VALUE
+        for (i in range) {
+            if (dists[i] < bd) {
+                bd = dists[i]
+                best = i
+            }
+        }
+        return best
     }
 
     /** Reads the whole board. Returns null if the result isn't a sane chess position. */
     fun readPosition(px: IntArray, t: Templates, whiteAtBottom: Boolean): CharArray? {
         val pos = CharArray(64) { '.' }
+        val sqDists = arrayOfNulls<FloatArray>(64)
+        val isWhiteSq = BooleanArray(64)
+        val typeIdx = IntArray(64) { -1 }
+
         for (r in 0 until 8) for (c in 0 until 8) {
             val s = analyzeSquare(px, r, c)
             if (s.score < t.occThreshold) continue
             val file = if (whiteAtBottom) c else 7 - c
             val rank = if (whiteAtBottom) 7 - r else r
-            pos[rank * 8 + file] = classify(s, t)
+            val idx = rank * 8 + file
+            val d = distances(s, t)
+            sqDists[idx] = d
+            isWhiteSq[idx] = s.lum > t.lumThreshold
+            typeIdx[idx] = bestClassIn(d, 0..5)
         }
+
+        fun ensureSingleKing(white: Boolean): Boolean {
+            val sideSquares = (0 until 64).filter { typeIdx[it] >= 0 && isWhiteSq[it] == white }
+            if (sideSquares.isEmpty()) return false
+            val kingSquares = sideSquares.filter { typeIdx[it] == 5 }
+            if (kingSquares.size > 1) {
+                // Keep only the strongest King match; demote extras to their next-best non-king piece.
+                val bestKing = kingSquares.minByOrNull { sqDists[it]!![5] }!!
+                for (sq in kingSquares) {
+                    if (sq != bestKing) {
+                        typeIdx[sq] = bestClassIn(sqDists[sq]!!, 0..4)
+                    }
+                }
+            } else if (kingSquares.isEmpty()) {
+                // Promote the piece closest to King template (smaller excess loss over its top match).
+                val bestCandidate = sideSquares.minByOrNull { sq ->
+                    val d = sqDists[sq]!!
+                    d[5] - d[typeIdx[sq]]
+                } ?: return false
+                typeIdx[bestCandidate] = 5
+            }
+            return true
+        }
+
+        val hasWhiteKing = ensureSingleKing(white = true)
+        val hasBlackKing = ensureSingleKing(white = false)
+        if (!hasWhiteKing || !hasBlackKing) {
+            val wCnt = (0 until 64).count { typeIdx[it] >= 0 && isWhiteSq[it] }
+            val bCnt = (0 until 64).count { typeIdx[it] >= 0 && !isWhiteSq[it] }
+            lastProblem = "Board checker saw too few pieces ($wCnt W, $bCnt B)"
+            return null
+        }
+
+        // Prevent minor template noise from placing a pawn on rank 1 or 8.
+        for (f in 0..7) {
+            for (idx in intArrayOf(f, 56 + f)) {
+                if (typeIdx[idx] == 0) {
+                    val d = sqDists[idx]!!
+                    typeIdx[idx] = bestClassIn(d, 1..4)
+                }
+            }
+        }
+
         var wk = 0
         var bk = 0
         var n = 0
-        for (ch in pos) {
+        for (idx in 0 until 64) {
+            val ti = typeIdx[idx]
+            if (ti < 0) continue
+            val base = "pnbrqk"[ti]
+            val ch = if (isWhiteSq[idx]) base.uppercaseChar() else base
+            pos[idx] = ch
             if (ch == 'K') wk++
             if (ch == 'k') bk++
-            if (ch != '.') n++
+            n++
         }
         if (wk != 1 || bk != 1) {
             lastProblem = "Board checker saw $n pieces ($wk W king, $bk B king)"

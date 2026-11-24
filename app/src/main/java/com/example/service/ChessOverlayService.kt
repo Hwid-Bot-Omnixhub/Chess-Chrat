@@ -459,6 +459,7 @@ class ChessOverlayService : Service() {
             val detected = poll.activeChessApp
             if (detected?.packageName != lastNotifiedAppPkg) {
               lastNotifiedAppPkg = detected?.packageName
+              BoardVisionScanner.resetCaptureThrottle()
               ChessAssistantHub.setDetectedForegroundApp(detected)
               if (detected != null) {
                 ChessAssistantHub.setOverlayServiceState(
@@ -500,7 +501,7 @@ class ChessOverlayService : Service() {
               pulseHideOverlay = ::setOverlayHiddenForCapture,
             )
           }
-          delay(if (st.antiLagEnabled) 680L else 380L)
+          delay(BoardVisionScanner.recommendedLoopDelayMs(st.antiLagEnabled))
         }
       }
   }

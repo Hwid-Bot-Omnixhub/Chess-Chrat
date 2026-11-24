@@ -351,5 +351,85 @@ class ChessEngineUnitTest {
     assertTrue(local.topMoves.none { it.tacticalTag.contains("Book", ignoreCase = true) })
     assertEquals(null, local.openingName)
   }
+
+  @Test
+  fun visionRejectsAlreadyPlayedE4DuringLearnAndDisambiguatesKingOverlap() {
+    val px = IntArray(com.example.chessreviewer.Vision.B * com.example.chessreviewer.Vision.B)
+    val startPos = arrayOf(
+      "rnbqkbnr",
+      "pppppppp",
+      "........",
+      "........",
+      "........",
+      "........",
+      "PPPPPPPP",
+      "RNBQKBNR",
+    )
+
+    fun drawSquare(row: Int, col: Int, piece: Char) {
+      val n = com.example.chessreviewer.Vision.N
+      val isLight = (row + col) % 2 == 0
+      val bg = if (isLight) 0xFFEEEED2.toInt() else 0xFF769656.toInt()
+      val fg = if (piece.isUpperCase()) 0xFFFAFAFA.toInt() else 0xFF1F1F1F.toInt()
+      for (y in 0 until n) {
+        for (x in 0 until n) {
+          val gx = col * n + x
+          val gy = row * n + y
+          var drawFg = false
+          val cx = x - n / 2
+          val cy = y - n / 2
+          when (piece.lowercaseChar()) {
+            'p' -> drawFg = cx * cx + cy * cy <= 64
+            'r' -> drawFg = kotlin.math.abs(cx) <= 8 && kotlin.math.abs(cy) <= 11
+            'n' -> drawFg = kotlin.math.abs(cx) <= 10 && kotlin.math.abs(cy) <= 10 && cx + cy <= 8
+            'b' -> drawFg = kotlin.math.abs(cx) * 2 + kotlin.math.abs(cy) <= 22
+            'q' -> drawFg = (cx * cx + cy * cy <= 144) && !(kotlin.math.abs(cx) <= 3 && cy < -8)
+            'k' -> drawFg = kotlin.math.abs(cx) <= 12 && kotlin.math.abs(cy) <= 12
+          }
+          px[gy * com.example.chessreviewer.Vision.B + gx] = if (drawFg) fg else bg
+        }
+      }
+    }
+
+    for (r in 0 until 8) {
+      for (c in 0 until 8) {
+        drawSquare(r, c, startPos[r][c])
+      }
+    }
+    val learned = com.example.chessreviewer.Vision.learn(px).templates!!
+
+    // Play 1.e4 and make d1 look slightly King-like (same box silhouette as K)
+    drawSquare(6, 4, '.')
+    drawSquare(4, 4, 'P')
+    drawSquare(7, 3, 'K')
+
+    // Must NOT treat 1.e4 as a fresh unplayed starting layout
+    val relearnOnE4 = com.example.chessreviewer.Vision.learn(px)
+    assertEquals(null, relearnOnE4.templates)
+
+    // Must still read a valid position with exactly 1 White King and 1 Black King
+    val pos = com.example.chessreviewer.Vision.readPosition(px, learned, whiteAtBottom = true)
+    assertNotNull(pos)
+    assertEquals(1, pos!!.count { it == 'K' })
+    assertEquals(1, pos.count { it == 'k' })
+    assertEquals('P', pos[3 * 8 + 4]) // e4 occupied by white pawn
+    assertEquals('.', pos[1 * 8 + 4]) // e2 empty
+  }
+
+  @Test
+  fun boardVisionScannerAdaptiveDelayIncreasesWhenBoardIsUnchanged() {
+    val active = com.example.service.BoardVisionScanner.recommendedLoopDelayMs(false, streak = 0)
+    val idle1 = com.example.service.BoardVisionScanner.recommendedLoopDelayMs(false, streak = 2)
+    val idle2 = com.example.service.BoardVisionScanner.recommendedLoopDelayMs(false, streak = 5)
+    val deepIdle = com.example.service.BoardVisionScanner.recommendedLoopDelayMs(false, streak = 10)
+    assertTrue(active < idle1)
+    assertTrue(idle1 < idle2)
+    assertTrue(idle2 < deepIdle)
+
+    val antiLagActive = com.example.service.BoardVisionScanner.recommendedLoopDelayMs(true, streak = 0)
+    val antiLagDeepIdle = com.example.service.BoardVisionScanner.recommendedLoopDelayMs(true, streak = 10)
+    assertTrue(antiLagActive >= active)
+    assertTrue(antiLagDeepIdle >= deepIdle)
+  }
 }
 

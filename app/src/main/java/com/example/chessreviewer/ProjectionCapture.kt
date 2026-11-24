@@ -24,6 +24,14 @@ class ProjectionCapture {
     var lastError: String = ""
         private set
 
+    @Volatile
+    var wasNoNewFrame: Boolean = false
+        private set
+
+    @Volatile
+    private var frameSequence: Long = 0L
+
+    private val frameSignal = Object()
     private var projection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var imageReader: ImageReader? = null
@@ -39,6 +47,8 @@ class ProjectionCapture {
         }
     }
 
+    fun currentFrameSequence(): Long = frameSequence
+
     @SuppressLint("WrongConstant")
     fun start(mediaProjection: MediaProjection, screenWidth: Int, screenHeight: Int, densityDpi: Int) {
         stop()
@@ -49,6 +59,8 @@ class ProjectionCapture {
             }
             width = screenWidth
             height = screenHeight
+            frameSequence = 0L
+            wasNoNewFrame = false
 
             val thread = HandlerThread("KnightSightProjection").apply { start() }
             val h = Handler(thread.looper)
@@ -56,7 +68,13 @@ class ProjectionCapture {
             handler = h
 
             mediaProjection.registerCallback(projectionCallback, h)
-            val reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+            val reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 3)
+            reader.setOnImageAvailableListener({
+                synchronized(frameSignal) {
+                    frameSequence++
+                    frameSignal.notifyAll()
+                }
+            }, h)
             val display = mediaProjection.createVirtualDisplay(
                 "KnightSightBoardCapture",
                 width,
@@ -76,20 +94,40 @@ class ProjectionCapture {
         }
     }
 
-    fun grab(): Bitmap? {
+    fun grab(waitAfterSeq: Long = -1L, waitForFreshMs: Long = 0L): Bitmap? {
+        if (!isActive) return null
+        if (waitAfterSeq >= 0L && waitForFreshMs > 0L) {
+            val deadline = android.os.SystemClock.uptimeMillis() + waitForFreshMs
+            synchronized(frameSignal) {
+                while (isActive && frameSequence <= waitAfterSeq) {
+                    val remaining = deadline - android.os.SystemClock.uptimeMillis()
+                    if (remaining <= 0L) break
+                    try {
+                        frameSignal.wait(remaining)
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        break
+                    }
+                }
+            }
+        }
+
         synchronized(lock) {
             val reader = imageReader ?: return null
             if (!isActive) return null
             val image = try {
                 reader.acquireLatestImage()
             } catch (t: Throwable) {
+                wasNoNewFrame = false
                 lastError = t.message ?: "ImageReader failed"
                 null
             } ?: run {
-                lastError = "Waiting for next screen frame"
+                wasNoNewFrame = true
+                lastError = "No screen update"
                 return null
             }
 
+            wasNoNewFrame = false
             return try {
                 val plane = image.planes[0]
                 val buffer = plane.buffer

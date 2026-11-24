@@ -51,6 +51,28 @@ object BoardVisionScanner {
   @Volatile
   private var lastAppliedPlacement: String? = null
 
+  @Volatile
+  private var unchangedStreak: Int = 0
+
+  fun resetCaptureThrottle() {
+    unchangedStreak = 0
+  }
+
+  /**
+   * Adaptive delay between screen captures: fast right after a move or screen transition,
+   * progressively backing off when the board state remains unchanged to save CPU and avoid flicker.
+   */
+  fun recommendedLoopDelayMs(
+    antiLagEnabled: Boolean,
+    streak: Int = unchangedStreak,
+  ): Long =
+    when {
+      streak <= 0 -> if (antiLagEnabled) 750L else 550L
+      streak <= 2 -> if (antiLagEnabled) 1300L else 950L
+      streak <= 6 -> if (antiLagEnabled) 2200L else 1600L
+      else -> if (antiLagEnabled) 3200L else 2500L
+    }
+
   fun ensureInitialized(context: Context): SecureCapture {
     val existing = secureCapture
     if (existing != null) return existing
@@ -70,10 +92,14 @@ object BoardVisionScanner {
 
   fun refreshReadiness(context: Context) {
     val sc = ensureInitialized(context)
+    val shizukuReady = sc.shizuku.ready()
+    if (shizukuReady && !sc.shizuku.isBound()) {
+      sc.shizuku.warmUpAsync()
+    }
     ChessAssistantHub.setCaptureReadiness(
       shizukuInstalled = sc.shizuku.isAppInstalled(),
       shizukuRunning = sc.shizuku.isRunning(),
-      shizukuReady = sc.shizuku.ready(),
+      shizukuReady = shizukuReady,
       mediaProjectionReady = projectionCapture.isActive,
     )
   }
@@ -96,6 +122,7 @@ object BoardVisionScanner {
     densityDpi: Int,
   ) {
     projectionCapture.start(projection, screenWidth, screenHeight, densityDpi)
+    resetCaptureThrottle()
     refreshReadiness(context)
     ChessAssistantHub.setBoardCheckerStatus(
       if (projectionCapture.isActive) {
@@ -127,6 +154,7 @@ object BoardVisionScanner {
     val frame: Bitmap?,
     val rect: BoardFinder.BoardRect?,
     val error: String = "",
+    val unchangedFrame: Boolean = false,
   )
 
   private data class LocatedBoard(
@@ -140,6 +168,7 @@ object BoardVisionScanner {
     pulseHideOverlay: (suspend (Boolean) -> Unit)? = null,
   ): ScanOutcome =
     scanMutex.withLock {
+      resetCaptureThrottle()
       val appCtx = context.applicationContext
       val captured = captureAndFindBoard(appCtx, pulseHideOverlay)
       val frame = captured.frame
@@ -172,29 +201,16 @@ object BoardVisionScanner {
         return@withLock ScanOutcome(false, err)
       }
 
-      cachedTemplates = tpl
-      cachedWhiteBottom = result.whiteBottom
-      tracker.reset()
-      val readCheck =
-        withContext(Dispatchers.Default) {
-          Vision.readPosition(located.downscaled, tpl, result.whiteBottom)
-        }
-      if (readCheck != null) {
-        tracker.update(readCheck, result.whiteBottom)
-        lastAppliedPlacement = Chess.placement(readCheck)
-      } else {
-        lastAppliedPlacement = Chess.START
-      }
-      lastPixelSignature = computeSignature(located.downscaled)
-
-      withContext(Dispatchers.IO) {
-        prefsRepo.saveVisionTemplates(tpl.serialize(), result.whiteBottom)
-      }
-
-      ChessAssistantHub.loadFen(BoardState.STARTING_FEN, "Board Checker")
       val sideLabel = if (result.whiteBottom) "White at bottom" else "Black at bottom"
       val okMsg = "Board found & piece theme learned ($sideLabel)"
-      ChessAssistantHub.setVisionLearned(result.whiteBottom, okMsg)
+      applyLearnedPosition(
+        tpl = tpl,
+        whiteBottom = result.whiteBottom,
+        downscaled = located.downscaled,
+        sig = computeSignature(located.downscaled),
+        prefsRepo = prefsRepo,
+        statusMessage = okMsg,
+      )
       ScanOutcome(true, okMsg)
     }
 
@@ -207,8 +223,14 @@ object BoardVisionScanner {
     scanMutex.withLock {
       val appCtx = context.applicationContext
       val captured = captureAndFindBoard(appCtx, pulseHideOverlay)
+      if (captured.unchangedFrame) {
+        unchangedStreak = (unchangedStreak + 1).coerceAtMost(100)
+        return@withLock ScanOutcome(true, "Board unchanged")
+      }
+
       val frame = captured.frame
       if (frame == null) {
+        unchangedStreak = (unchangedStreak + 1).coerceAtMost(100)
         val msg = captured.error.ifBlank { captureFailureMessage(appCtx) }
         if (!isAuto) ChessAssistantHub.setBoardCheckerStatus(msg)
         return@withLock ScanOutcome(false, msg)
@@ -223,8 +245,10 @@ object BoardVisionScanner {
         }
 
       if (located == null) {
+        val wasVisible = st.isBoardVisibleOnScreen
         lastPixelSignature = 0L
         ChessAssistantHub.setBoardVisibleOnScreen(false)
+        unchangedStreak = if (wasVisible) 0 else (unchangedStreak + 1).coerceAtMost(100)
         val msg = "Waiting for chessboard..."
         if (!isAuto) ChessAssistantHub.setBoardCheckerStatus(msg)
         return@withLock ScanOutcome(false, msg)
@@ -233,9 +257,10 @@ object BoardVisionScanner {
       val sig = computeSignature(located.downscaled)
       val existingTemplates = cachedTemplates
 
-      // Anti-lag optimization: skip Vision classification when pixels are identical
+      // Anti-lag optimization: skip Vision classification and back off when pixels are identical
       if (isAuto && existingTemplates != null && sig == lastPixelSignature && lastAppliedPlacement != null) {
         ChessAssistantHub.setBoardVisibleOnScreen(true)
+        unchangedStreak = (unchangedStreak + 1).coerceAtMost(100)
         return@withLock ScanOutcome(true, "Board synced")
       }
 
@@ -244,32 +269,21 @@ object BoardVisionScanner {
         val autoLearn = withContext(Dispatchers.Default) { Vision.learn(located.downscaled) }
         val newTpl = autoLearn.templates
         if (newTpl != null && autoLearn.error == null) {
-          cachedTemplates = newTpl
-          cachedWhiteBottom = autoLearn.whiteBottom
-          tracker.reset()
-          val startPos =
-            withContext(Dispatchers.Default) {
-              Vision.readPosition(located.downscaled, newTpl, autoLearn.whiteBottom)
-            }
-          if (startPos != null) {
-            tracker.update(startPos, autoLearn.whiteBottom)
-            lastAppliedPlacement = Chess.placement(startPos)
-          } else {
-            lastAppliedPlacement = Chess.START
-          }
-          lastPixelSignature = sig
-          if (prefsRepo != null) {
-            withContext(Dispatchers.IO) {
-              prefsRepo.saveVisionTemplates(newTpl.serialize(), autoLearn.whiteBottom)
-            }
-          }
-          ChessAssistantHub.loadFen(BoardState.STARTING_FEN, "Board Checker")
           val sideLabel = if (autoLearn.whiteBottom) "White" else "Black"
           val msg = "Game detected ($sideLabel at bottom)"
-          ChessAssistantHub.setVisionLearned(autoLearn.whiteBottom, msg)
+          applyLearnedPosition(
+            tpl = newTpl,
+            whiteBottom = autoLearn.whiteBottom,
+            downscaled = located.downscaled,
+            sig = sig,
+            prefsRepo = prefsRepo,
+            statusMessage = msg,
+          )
+          resetCaptureThrottle()
           return@withLock ScanOutcome(true, msg)
         } else {
           ChessAssistantHub.setBoardVisibleOnScreen(true)
+          unchangedStreak = (unchangedStreak + 1).coerceAtMost(100)
           val msg = "Board found — start a new game or tap Learn Start"
           ChessAssistantHub.setBoardCheckerStatus(msg)
           return@withLock ScanOutcome(false, msg)
@@ -298,34 +312,23 @@ object BoardVisionScanner {
         val relearn = withContext(Dispatchers.Default) { Vision.learn(located.downscaled) }
         val newTpl = relearn.templates
         if (newTpl != null && relearn.error == null) {
-          cachedTemplates = newTpl
-          cachedWhiteBottom = relearn.whiteBottom
-          tracker.reset()
-          val startPos =
-            withContext(Dispatchers.Default) {
-              Vision.readPosition(located.downscaled, newTpl, relearn.whiteBottom)
-            }
-          if (startPos != null) {
-            tracker.update(startPos, relearn.whiteBottom)
-            lastAppliedPlacement = Chess.placement(startPos)
-          } else {
-            lastAppliedPlacement = Chess.START
-          }
-          lastPixelSignature = sig
-          if (prefsRepo != null) {
-            withContext(Dispatchers.IO) {
-              prefsRepo.saveVisionTemplates(newTpl.serialize(), relearn.whiteBottom)
-            }
-          }
-          ChessAssistantHub.loadFen(BoardState.STARTING_FEN, "Board Checker")
           val sideLabel = if (relearn.whiteBottom) "White" else "Black"
           val msg = "New game started ($sideLabel at bottom)"
-          ChessAssistantHub.setVisionLearned(relearn.whiteBottom, msg)
+          applyLearnedPosition(
+            tpl = newTpl,
+            whiteBottom = relearn.whiteBottom,
+            downscaled = located.downscaled,
+            sig = sig,
+            prefsRepo = prefsRepo,
+            statusMessage = msg,
+          )
+          resetCaptureThrottle()
           return@withLock ScanOutcome(true, msg)
         }
       }
 
       if (pos == null) {
+        unchangedStreak = (unchangedStreak + 1).coerceAtMost(100)
         val problem = Vision.lastProblem.ifBlank { "Reading board..." }
         if (!isAuto) ChessAssistantHub.setBoardCheckerStatus(problem)
         return@withLock ScanOutcome(false, problem)
@@ -340,13 +343,49 @@ object BoardVisionScanner {
       val placement = fen.substringBefore(' ')
       if (isAuto && placement == lastAppliedPlacement && effectiveWhiteBottom == !st.flippedBoard) {
         ChessAssistantHub.setBoardVisibleOnScreen(true)
+        unchangedStreak = (unchangedStreak + 1).coerceAtMost(100)
         return@withLock ScanOutcome(true, "Board synced")
       }
 
+      resetCaptureThrottle()
       lastAppliedPlacement = placement
       ChessAssistantHub.applyScannedBoard(fen, effectiveWhiteBottom)
       ScanOutcome(true, "Watching (${if (tracker.blackToMove) "Black" else "White"} to move)")
     }
+
+  private suspend fun applyLearnedPosition(
+    tpl: Templates,
+    whiteBottom: Boolean,
+    downscaled: IntArray,
+    sig: Long,
+    prefsRepo: PreferencesRepository?,
+    statusMessage: String,
+  ) {
+    cachedTemplates = tpl
+    cachedWhiteBottom = whiteBottom
+    tracker.reset()
+    val readCheck =
+      withContext(Dispatchers.Default) {
+        Vision.readPosition(downscaled, tpl, whiteBottom)
+      }
+    val fenToLoad =
+      if (readCheck != null) {
+        tracker.update(readCheck, whiteBottom)
+        lastAppliedPlacement = Chess.placement(readCheck)
+        tracker.fen(readCheck)
+      } else {
+        lastAppliedPlacement = Chess.START
+        BoardState.STARTING_FEN
+      }
+    lastPixelSignature = sig
+    if (prefsRepo != null) {
+      withContext(Dispatchers.IO) {
+        prefsRepo.saveVisionTemplates(tpl.serialize(), whiteBottom)
+      }
+    }
+    ChessAssistantHub.loadFen(fenToLoad, "Board Checker")
+    ChessAssistantHub.setVisionLearned(whiteBottom, statusMessage)
+  }
 
   private suspend fun extractLocatedBoard(
     context: Context,
@@ -408,67 +447,66 @@ object BoardVisionScanner {
 
   /**
    * Captures a frame cleanly (hiding the overlay briefly so our arrows never obscure squares)
-   * and localizes any chessboard using [BoardFinder.findFromSecureShot] when Shizuku [com.example.chessreviewer.ISecureShot]
-   * is available, or [BoardFinder.find] over MediaProjection frames.
+   * and localizes any chessboard using [BoardFinder.findFromSecureShot] when Shizuku
+   * [com.example.chessreviewer.ISecureShot] is available, or [BoardFinder.find] over MediaProjection frames.
    */
   private suspend fun captureAndFindBoard(
     context: Context,
     pulseHideOverlay: (suspend (Boolean) -> Unit)?,
   ): CaptureAndRect {
     val sc = ensureInitialized(context)
-    if (pulseHideOverlay != null &&
-      ChessAssistantHub.state.value.overlayGridVisible &&
-      ChessAssistantHub.state.value.isBoardVisibleOnScreen
-    ) {
-      pulseHideOverlay.invoke(true)
-      delay(48L)
-      return try {
-        withContext(Dispatchers.IO) {
-          val shot = if (sc.shizuku.ready()) sc.shizuku.bindService() else null
-          if (shot != null) {
-            val res = BoardFinder.findFromSecureShot(shot)
-            if (res.frame != null) {
-              return@withContext CaptureAndRect(res.frame, res.boardRect, res.error)
-            }
-          }
-          val fallbackBmp = when {
-            projectionCapture.isActive -> projectionCapture.grab()
-            else -> sc.grab()
-          }
-          if (fallbackBmp == null) {
-            CaptureAndRect(null, null, captureFailureMessage(context))
-          } else {
-            val rect = BoardFinder.find(fallbackBmp)
-            CaptureAndRect(fallbackBmp, rect)
-          }
-        }
-      } finally {
-        pulseHideOverlay.invoke(false)
-        refreshReadiness(context)
-      }
+    val shouldHideOverlay =
+      pulseHideOverlay != null &&
+        ChessAssistantHub.state.value.overlayGridVisible &&
+        ChessAssistantHub.state.value.isBoardVisibleOnScreen
+
+    val seqBeforeHide = if (projectionCapture.isActive) projectionCapture.currentFrameSequence() else -1L
+    if (shouldHideOverlay) {
+      pulseHideOverlay!!.invoke(true)
+      // Allow SurfaceFlinger to composite a clean frame without our red/dark arrows
+      delay(95L)
     }
 
     return try {
       withContext(Dispatchers.IO) {
-        val shot = if (sc.shizuku.ready()) sc.shizuku.bindService() else null
+        val shot = if (sc.shizuku.ready()) sc.shizuku.bindService(2_500L) else null
         if (shot != null) {
           val res = BoardFinder.findFromSecureShot(shot)
           if (res.frame != null) {
             return@withContext CaptureAndRect(res.frame, res.boardRect, res.error)
           }
         }
-        val fallbackBmp = when {
-          projectionCapture.isActive -> projectionCapture.grab()
-          else -> sc.grab()
+
+        if (projectionCapture.isActive) {
+          val projBmp = projectionCapture.grab(
+            waitAfterSeq = if (shouldHideOverlay) seqBeforeHide else -1L,
+            waitForFreshMs = if (shouldHideOverlay) 140L else 0L,
+          )
+          return@withContext if (projBmp != null) {
+            val rect = BoardFinder.find(projBmp)
+            CaptureAndRect(projBmp, rect)
+          } else if (projectionCapture.wasNoNewFrame) {
+            CaptureAndRect(null, null, error = "", unchangedFrame = true)
+          } else {
+            CaptureAndRect(null, null, captureFailureMessage(context))
+          }
         }
-        if (fallbackBmp == null) {
-          CaptureAndRect(null, null, captureFailureMessage(context))
-        } else {
-          val rect = BoardFinder.find(fallbackBmp)
-          CaptureAndRect(fallbackBmp, rect)
+
+        // Only try non-Shizuku SecureCapture fallback (root screencap) so Shizuku is never double-bound
+        if (sc.mode == SecureCapture.Mode.ROOT) {
+          val rootBmp = sc.grab()
+          if (rootBmp != null) {
+            val rect = BoardFinder.find(rootBmp)
+            return@withContext CaptureAndRect(rootBmp, rect)
+          }
         }
+
+        CaptureAndRect(null, null, captureFailureMessage(context))
       }
     } finally {
+      if (shouldHideOverlay) {
+        pulseHideOverlay!!.invoke(false)
+      }
       refreshReadiness(context)
     }
   }
@@ -479,6 +517,7 @@ object BoardVisionScanner {
       sc.shizuku.isRunning() && !sc.shizuku.ready() ->
         "Grant Shizuku permission or enable Screen Capture in Watcher tab"
       projectionCapture.lastError.isNotBlank() -> projectionCapture.lastError
+      sc.shizuku.lastError.isNotBlank() -> sc.shizuku.lastError
       sc.lastError.isNotBlank() -> sc.lastError
       else -> "Enable Screen Capture (No Root) or start Shizuku first"
     }
@@ -507,15 +546,22 @@ object BoardVisionScanner {
 
   private fun computeSignature(downscaled: IntArray): Long {
     var hash = -3750763034362895579L
+    val offsets = intArrayOf(Vision.N / 4, Vision.N / 2, (Vision.N * 3) / 4)
     for (r in 0 until 8) {
-      val py = r * Vision.N + Vision.N / 2
+      val ry = r * Vision.N
       for (c in 0 until 8) {
-        val px = c * Vision.N + Vision.N / 2
-        val color = downscaled[py * Vision.B + px]
-        val quantized = ((color shr 19) and 0x1F shl 10) or
-          ((color shr 11) and 0x1F shl 5) or
-          ((color shr 3) and 0x1F)
-        hash = (hash xor quantized.toLong()) * 1099511628211L
+        val cx = c * Vision.N
+        for (oy in offsets) {
+          val py = ry + oy
+          for (ox in offsets) {
+            val px = cx + ox
+            val color = downscaled[py * Vision.B + px]
+            val quantized = ((color shr 19) and 0x1F shl 10) or
+              ((color shr 11) and 0x1F shl 5) or
+              ((color shr 3) and 0x1F)
+            hash = (hash xor quantized.toLong()) * 1099511628211L
+          }
+        }
       }
     }
     return hash

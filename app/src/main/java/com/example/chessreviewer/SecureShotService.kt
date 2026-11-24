@@ -1,31 +1,43 @@
 package com.example.chessreviewer
 
+import android.content.Context
 import android.graphics.Bitmap
+import androidx.annotation.Keep
 import java.io.ByteArrayOutputStream
+import kotlin.system.exitProcess
 
 /**
  * The code that actually reads a FLAG_SECURE screen.
  *
- * This class does not run in the app's process. Shizuku starts it in a process of its own,
- * with the uid of whoever started Shizuku: 2000 (shell) when Shizuku was brought up over ADB
- * or wireless debugging, 0 (root) when it was started as root. That process holds
- * android.permission.READ_FRAME_BUFFER, and one more thing is needed:
- *
- *   ScreenCapture.CaptureArgs.Builder#setCaptureSecureLayers(true)
- *
- * The class is loaded by name from Shizuku, so keep the package and the no-argument
- * constructor as they are.
+ * This class runs in the privileged Shizuku UserService process (`uid 2000` shell over ADB /
+ * wireless debugging, or `uid 0` if root). Supports both the Shizuku v13 Context constructor
+ * and the no-argument constructor, and exempts hidden APIs so ScreenCapture/SurfaceControl work
+ * on Android 12-16+.
  */
-class SecureShotService : ISecureShot.Stub() {
+@Keep
+class SecureShotService : ISecureShot.Stub {
+
+    constructor() : super() {
+        exemptHiddenApis()
+    }
+
+    @Suppress("UNUSED_PARAMETER")
+    constructor(context: Context) : super() {
+        exemptHiddenApis()
+    }
 
     @Volatile private var pending: ByteArray? = null
     @Volatile private var error = ""
 
     override fun destroy() {
-        try { System.exit(0) } catch (_: Throwable) { }
+        try {
+            exitProcess(0)
+        } catch (_: Throwable) {
+        }
     }
 
     override fun capture(width: Int, height: Int): Int {
+        exemptHiddenApis()
         pending = null
         error = ""
         val bitmap: Bitmap? = try {
@@ -63,6 +75,19 @@ class SecureShotService : ISecureShot.Stub() {
 
     override fun lastError(): String = error
 
+    private fun exemptHiddenApis() {
+        if (hiddenApiExempted) return
+        hiddenApiExempted = true
+        try {
+            val vmRuntimeClass = Class.forName("dalvik.system.VMRuntime")
+            val getRuntime = vmRuntimeClass.getDeclaredMethod("getRuntime")
+            val runtime = getRuntime.invoke(null)
+            val setExemptions = vmRuntimeClass.getDeclaredMethod("setHiddenApiExemptions", Array<String>::class.java)
+            setExemptions.invoke(runtime, arrayOf("L") as Any)
+        } catch (_: Throwable) {
+        }
+    }
+
     private fun describe(t: Throwable): String {
         var e: Throwable? = t
         var guard = 0
@@ -74,5 +99,10 @@ class SecureShotService : ISecureShot.Stub() {
         val name = real.javaClass.simpleName
         val message = real.message
         return if (message.isNullOrBlank()) name else "$name: $message"
+    }
+
+    companion object {
+        @Volatile
+        private var hiddenApiExempted = false
     }
 }

@@ -100,10 +100,8 @@ object DisplayCapture {
 
     private fun viaScreenCapture(w: Int, h: Int): Bitmap {
         val screenCapture = Class.forName("android.window.ScreenCapture")
-        val argsClass = Class.forName("android.window.ScreenCapture\$CaptureArgs")
         val listenerClass = Class.forName("android.window.ScreenCapture\$ScreenCaptureListener")
 
-        val args = buildCaptureArgs(w, h)
         val listener = screenCapture.getMethod("createSyncCaptureListener").invoke(null)
             ?: error("no screen capture listener")
         val wms = Class.forName("android.view.WindowManagerGlobal")
@@ -111,12 +109,15 @@ object DisplayCapture {
             .invoke(null)
             ?: error("window manager service is not reachable")
 
+        val args = buildCaptureArgs(w, h)
+        val argsActualClass = args.javaClass
+
         val entry = wms.javaClass.methods.firstOrNull { m ->
             m.name == "captureDisplay" &&
                 m.parameterTypes.size in 2..3 &&
                 m.parameterTypes.all { p ->
                     p == Int::class.javaPrimitiveType ||
-                        p.isAssignableFrom(argsClass) ||
+                        p.isAssignableFrom(argsActualClass) ||
                         p.isAssignableFrom(listenerClass)
                 }
         } ?: error("this build has no captureDisplay entry point")
@@ -136,12 +137,40 @@ object DisplayCapture {
     }
 
     private fun buildCaptureArgs(w: Int, h: Int): Any {
-        val builderClass = Class.forName("android.window.ScreenCapture\$CaptureArgs\$Builder")
-        val builder = builderClass.getDeclaredConstructor().newInstance()
+        val builderClass = try {
+            Class.forName("android.window.ScreenCapture\$DisplayCaptureArgs\$Builder")
+        } catch (_: Throwable) {
+            Class.forName("android.window.ScreenCapture\$CaptureArgs\$Builder")
+        }
+        val builder = try {
+            // DisplayCaptureArgs.Builder(IBinder displayToken) on some Android 14+ builds
+            val displayToken = try {
+                val scClass = Class.forName("android.view.SurfaceControl")
+                scClass.getMethod("getInternalDisplayToken").invoke(null)
+            } catch (_: Throwable) {
+                null
+            }
+            val tokenCtor = if (displayToken != null) {
+                builderClass.constructors.firstOrNull { c ->
+                    c.parameterTypes.size == 1 && c.parameterTypes[0].isAssignableFrom(displayToken.javaClass)
+                }
+            } else {
+                null
+            }
+            if (tokenCtor != null && displayToken != null) {
+                tokenCtor.newInstance(displayToken)
+            } else {
+                builderClass.getDeclaredConstructor().newInstance()
+            }
+        } catch (_: Throwable) {
+            Class.forName("android.window.ScreenCapture\$CaptureArgs\$Builder")
+                .getDeclaredConstructor().newInstance()
+        }
         call(builder, "setSourceCrop", Rect(0, 0, w, h))
         call(builder, "setSize", w, h)
         call(builder, "setDisplayId", 0)
         call(builder, "setCaptureSecureLayers", true)
+        call(builder, "setAllowProtected", true)
         return call(builder, "build") ?: error("could not build the capture arguments")
     }
 

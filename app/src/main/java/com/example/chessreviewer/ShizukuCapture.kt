@@ -7,7 +7,11 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.os.DeadObjectException
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import android.os.SystemClock
+import com.example.BuildConfig
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -15,7 +19,8 @@ import rikka.shizuku.Shizuku
 
 /**
  * Non-root Shizuku UserService bridge to [SecureShotService] via [ISecureShot].
- * Works over ADB / Wireless Debugging (uid 2000 shell) with zero root required.
+ * Works over ADB / Wireless Debugging (uid 2000 shell) and bypasses FLAG_SECURE layers.
+ * Uses Main-thread UserService dispatch + non-blocking retry cooldown so binding never hangs the UI.
  */
 class ShizukuCapture(private val appContext: Context) {
 
@@ -29,14 +34,23 @@ class ShizukuCapture(private val appContext: Context) {
     @Volatile
     private var latch: CountDownLatch? = null
 
+    @Volatile
+    private var bindInFlight: Boolean = false
+
+    @Volatile
+    private var nextBindAttemptAtMs: Long = 0L
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val bindLock = Any()
+
     private val userServiceArgs: Shizuku.UserServiceArgs by lazy {
         Shizuku.UserServiceArgs(
             ComponentName(appContext.packageName, SecureShotService::class.java.name)
         )
             .daemon(false)
             .processNameSuffix("secureshot")
-            .debuggable(false)
-            .version(1)
+            .debuggable(BuildConfig.DEBUG)
+            .version(BuildConfig.VERSION_CODE + 12)
     }
 
     private val connection = object : ServiceConnection {
@@ -46,11 +60,15 @@ class ShizukuCapture(private val appContext: Context) {
             } else {
                 null
             }
+            bindInFlight = false
+            nextBindAttemptAtMs = 0L
+            if (service != null) lastError = ""
             latch?.countDown()
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
             service = null
+            bindInFlight = false
         }
     }
 
@@ -75,6 +93,29 @@ class ShizukuCapture(private val appContext: Context) {
         false
     }
 
+    fun isBound(): Boolean = service?.let { runCatching { it.asBinder().pingBinder() }.getOrDefault(false) } == true
+
+    /** Pre-warms the Shizuku UserService connection asynchronously without blocking any caller. */
+    fun warmUpAsync() {
+        if (!ready() || isBound()) return
+        val now = SystemClock.uptimeMillis()
+        if (bindInFlight || now < nextBindAttemptAtMs) return
+        synchronized(bindLock) {
+            if (isBound() || bindInFlight || SystemClock.uptimeMillis() < nextBindAttemptAtMs) return
+            bindInFlight = true
+            mainHandler.post {
+                try {
+                    Shizuku.bindUserService(userServiceArgs, connection)
+                } catch (t: Throwable) {
+                    bindInFlight = false
+                    nextBindAttemptAtMs = SystemClock.uptimeMillis() + BIND_RETRY_COOLDOWN_MS
+                    lastError = "Shizuku bind error: ${t.message ?: t.javaClass.simpleName}"
+                    latch?.countDown()
+                }
+            }
+        }
+    }
+
     fun requestPermission(requestCode: Int = SHIZUKU_PERMISSION_REQUEST_CODE): Boolean {
         return try {
             if (!isRunning()) {
@@ -88,6 +129,8 @@ class ShizukuCapture(private val appContext: Context) {
                 lastError = "Shizuku v11+ is required"
                 false
             } else if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
+                nextBindAttemptAtMs = 0L
+                warmUpAsync()
                 true
             } else {
                 Shizuku.requestPermission(requestCode)
@@ -99,7 +142,7 @@ class ShizukuCapture(private val appContext: Context) {
         }
     }
 
-    fun bindService(timeoutMs: Long = 5_000L): ISecureShot? {
+    fun bindService(timeoutMs: Long = 3_500L): ISecureShot? {
         if (!ready()) {
             lastError = if (isRunning()) "Shizuku permission not granted" else "Shizuku is not running"
             return null
@@ -138,6 +181,8 @@ class ShizukuCapture(private val appContext: Context) {
             bmp
         } catch (_: DeadObjectException) {
             service = null
+            bindInFlight = false
+            nextBindAttemptAtMs = 0L
             lastError = "Shizuku user service disconnected; will reconnect"
             null
         } catch (t: Throwable) {
@@ -146,47 +191,83 @@ class ShizukuCapture(private val appContext: Context) {
         }
     }
 
-    fun grab(width: Int = 0, height: Int = 0, timeoutMs: Long = 5_000L): Bitmap? {
+    fun grab(width: Int = 0, height: Int = 0, timeoutMs: Long = 3_500L): Bitmap? {
         val svc = bindService(timeoutMs) ?: return null
         return decodeFromSecureShot(svc, width, height)
     }
 
-    @Synchronized
     private fun bindIfNeeded(timeoutMs: Long): ISecureShot? {
         val current = service
-        if (current != null && current.asBinder().pingBinder()) {
+        if (current != null && runCatching { current.asBinder().pingBinder() }.getOrDefault(false)) {
             return current
         }
         service = null
-        val waitLatch = CountDownLatch(1)
-        latch = waitLatch
-        try {
-            Shizuku.bindUserService(userServiceArgs, connection)
-        } catch (t: Throwable) {
-            lastError = "Could not bind Shizuku UserService: ${t.message ?: t.javaClass.simpleName}"
+
+        val now = SystemClock.uptimeMillis()
+        if (now < nextBindAttemptAtMs) {
             return null
         }
+
+        // Never await on the Main thread (would deadlock Shizuku's ServiceConnection callback)
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            warmUpAsync()
+            return null
+        }
+
+        val waitLatch = synchronized(bindLock) {
+            val existing = service
+            if (existing != null && runCatching { existing.asBinder().pingBinder() }.getOrDefault(false)) {
+                return existing
+            }
+            val newLatch = latch?.takeIf { bindInFlight && it.count > 0 } ?: CountDownLatch(1).also {
+                latch = it
+            }
+            if (!bindInFlight) {
+                bindInFlight = true
+                mainHandler.post {
+                    try {
+                        Shizuku.bindUserService(userServiceArgs, connection)
+                    } catch (t: Throwable) {
+                        bindInFlight = false
+                        nextBindAttemptAtMs = SystemClock.uptimeMillis() + BIND_RETRY_COOLDOWN_MS
+                        lastError = "Could not bind Shizuku UserService: ${t.message ?: t.javaClass.simpleName}"
+                        newLatch.countDown()
+                    }
+                }
+            }
+            newLatch
+        }
+
         val bound = try {
             waitLatch.await(timeoutMs, TimeUnit.MILLISECONDS)
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
             false
         }
-        if (!bound || service == null) {
-            lastError = "Timed out binding Shizuku SecureShotService"
+
+        val connected = service
+        if (!bound || connected == null) {
+            bindInFlight = false
+            nextBindAttemptAtMs = SystemClock.uptimeMillis() + BIND_RETRY_COOLDOWN_MS
+            lastError = "Shizuku service busy — retrying shortly (or use Standard Capture)"
             return null
         }
-        return service
+        return connected
     }
 
     @Synchronized
     fun unbind() {
         service = null
-        runCatching { Shizuku.unbindUserService(userServiceArgs, connection, true) }
+        bindInFlight = false
+        nextBindAttemptAtMs = 0L
+        mainHandler.post {
+            runCatching { Shizuku.unbindUserService(userServiceArgs, connection, true) }
+        }
     }
 
     companion object {
         const val SHIZUKU_PERMISSION_REQUEST_CODE = 4201
         private const val CHUNK_SIZE = 256 * 1024
+        private const val BIND_RETRY_COOLDOWN_MS = 8_000L
     }
 }
