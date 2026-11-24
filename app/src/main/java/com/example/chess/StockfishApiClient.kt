@@ -3,6 +3,7 @@ package com.example.chess
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import java.util.concurrent.TimeUnit
+import kotlin.math.abs
 import kotlin.math.roundToInt
 import okhttp3.OkHttpClient
 import retrofit2.Retrofit
@@ -19,12 +20,32 @@ data class StockfishOnlineResponse(
   val data: String? = null,
 )
 
+data class LichessPvItem(
+  val moves: String = "",
+  val cp: Int? = null,
+  val mate: Int? = null,
+)
+
+data class LichessCloudEvalResponse(
+  val fen: String? = null,
+  val depth: Int = 0,
+  val pvs: List<LichessPvItem> = emptyList(),
+)
+
 interface StockfishOnlineService {
   @GET("api/s/v2.php")
   suspend fun evaluatePosition(
     @Query("fen") fen: String,
     @Query("depth") depth: Int,
   ): StockfishOnlineResponse
+}
+
+interface LichessCloudService {
+  @GET("api/cloud-eval")
+  suspend fun cloudEval(
+    @Query("fen") fen: String,
+    @Query("multiPv") multiPv: Int = 3,
+  ): LichessCloudEvalResponse
 }
 
 data class StockfishQueryResult(
@@ -36,11 +57,14 @@ data class StockfishQueryResult(
   val pvLine: List<String>,
   val depth: Int,
   val tacticalTag: String,
+  val sourceLabel: String = "Stockfish",
+  val extraTopMoves: List<SuggestedMove> = emptyList(),
 )
 
 object StockfishApiClient {
 
-  private const val BASE_URL = "https://stockfish.online/"
+  private const val STOCKFISH_ONLINE_URL = "https://stockfish.online/"
+  private const val LICHESS_URL = "https://lichess.org/"
 
   private val moshi: Moshi by lazy {
     Moshi.Builder().add(KotlinJsonAdapterFactory()).build()
@@ -54,27 +78,59 @@ object StockfishApiClient {
       .build()
   }
 
-  private val service: StockfishOnlineService by lazy {
+  private val stockfishOnlineService: StockfishOnlineService by lazy {
     Retrofit.Builder()
-      .baseUrl(BASE_URL)
+      .baseUrl(STOCKFISH_ONLINE_URL)
       .client(okHttpClient)
       .addConverterFactory(MoshiConverterFactory.create(moshi))
       .build()
       .create(StockfishOnlineService::class.java)
   }
 
+  private val lichessCloudService: LichessCloudService by lazy {
+    Retrofit.Builder()
+      .baseUrl(LICHESS_URL)
+      .client(okHttpClient)
+      .addConverterFactory(MoshiConverterFactory.create(moshi))
+      .build()
+      .create(LichessCloudService::class.java)
+  }
+
   suspend fun fetchBestMove(board: BoardState, depth: Int): StockfishQueryResult? {
     val clampedDepth = depth.coerceIn(1, 15)
     val fen = board.toFen()
-    val response =
-      runCatching { service.evaluatePosition(fen = fen, depth = clampedDepth) }.getOrNull()
-        ?: return null
+    val legal = ChessRules.generateLegalMoves(board)
+    if (legal.isEmpty()) return null
 
-    if (!response.success) return null
+    // 1. Primary: Stockfish Online REST API at requested Elo-mapped depth (1..15)
+    val sfOnline =
+      runCatching { stockfishOnlineService.evaluatePosition(fen = fen, depth = clampedDepth) }
+        .getOrNull()
 
+    if (sfOnline != null && sfOnline.success && !sfOnline.bestmove.isNullOrBlank()) {
+      val parsed = parseStockfishOnline(board, legal, sfOnline, clampedDepth)
+      if (parsed != null) return parsed
+    }
+
+    // 2. Secondary: Lichess Stockfish Cloud Eval (MultiPV 3)
+    val lichessResp =
+      runCatching { lichessCloudService.cloudEval(fen = fen, multiPv = 3) }.getOrNull()
+    if (lichessResp != null && lichessResp.pvs.isNotEmpty()) {
+      val parsedLichess = parseLichessCloud(board, legal, lichessResp)
+      if (parsedLichess != null) return parsedLichess
+    }
+
+    return null
+  }
+
+  private fun parseStockfishOnline(
+    board: BoardState,
+    legal: List<Move>,
+    response: StockfishOnlineResponse,
+    depth: Int,
+  ): StockfishQueryResult? {
     val rawBest = response.bestmove ?: return null
     val uciToken = parseUciFromBestMove(rawBest) ?: return null
-    val legal = ChessRules.generateLegalMoves(board)
     val matchedMove = legal.find { it.uci.equals(uciToken, ignoreCase = true) } ?: return null
     val san = ChessRules.toSan(board, matchedMove, legal)
 
@@ -87,17 +143,7 @@ object StockfishApiClient {
         else -> 0
       }
 
-    val scoreDisplay =
-      when {
-        mateVal != null && mateVal > 0 -> "#M$mateVal"
-        mateVal != null && mateVal < 0 -> "-#M${-mateVal}"
-        mateVal == 0 -> if (board.sideToMove == PieceColor.WHITE) "0-1" else "1-0"
-        else -> {
-          val pawns = evalCp / 100.0
-          if (pawns >= 0) String.format("+%.1f", pawns) else String.format("%.1f", pawns)
-        }
-      }
-
+    val scoreDisplay = formatCloudScore(board, evalCp, mateVal)
     val pvSan = convertContinuationToSan(board, response.continuation, san)
     val tag = classifyStockfishMove(board, matchedMove, san, mateVal)
 
@@ -105,16 +151,78 @@ object StockfishApiClient {
       bestMove = matchedMove,
       san = san,
       evalCp = evalCp,
-      mateIn = mateVal?.takeIf { it != 0 }?.let { kotlin.math.abs(it) },
+      mateIn = mateVal?.takeIf { it != 0 }?.let { abs(it) },
       scoreDisplay = scoreDisplay,
       pvLine = pvSan,
-      depth = clampedDepth,
+      depth = depth,
       tacticalTag = tag,
+      sourceLabel = "Stockfish D$depth",
     )
   }
 
+  private fun parseLichessCloud(
+    board: BoardState,
+    legal: List<Move>,
+    response: LichessCloudEvalResponse,
+  ): StockfishQueryResult? {
+    val parsedPvs =
+      response.pvs.mapIndexedNotNull { idx, pv ->
+        val tokens = pv.moves.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
+        val firstUci = tokens.firstOrNull() ?: return@mapIndexedNotNull null
+        val matched = legal.find { it.uci.equals(firstUci, ignoreCase = true) }
+          ?: return@mapIndexedNotNull null
+        val san = ChessRules.toSan(board, matched, legal)
+        val mateVal = pv.mate
+        val evalCp =
+          when {
+            mateVal != null && mateVal > 0 -> 50_000 - mateVal * 10
+            mateVal != null && mateVal < 0 -> -50_000 - mateVal * 10
+            pv.cp != null -> pv.cp
+            else -> 0
+          }
+        val scoreDisplay = formatCloudScore(board, evalCp, mateVal)
+        val pvSan = convertContinuationToSan(board, pv.moves, san)
+        val tag = classifyStockfishMove(board, matched, san, mateVal)
+        SuggestedMove(
+          rank = idx + 1,
+          move = matched,
+          san = san,
+          scoreCp = evalCp,
+          mateIn = mateVal?.takeIf { it != 0 }?.let { abs(it) },
+          scoreDisplay = scoreDisplay,
+          pvLine = pvSan,
+          tacticalTag = tag,
+        )
+      }
+
+    val first = parsedPvs.firstOrNull() ?: return null
+    val depth = response.depth.coerceAtLeast(15)
+    return StockfishQueryResult(
+      bestMove = first.move,
+      san = first.san,
+      evalCp = first.scoreCp,
+      mateIn = first.mateIn,
+      scoreDisplay = first.scoreDisplay,
+      pvLine = first.pvLine,
+      depth = depth,
+      tacticalTag = first.tacticalTag,
+      sourceLabel = "Stockfish Cloud D$depth",
+      extraTopMoves = parsedPvs.drop(1),
+    )
+  }
+
+  private fun formatCloudScore(board: BoardState, evalCp: Int, mateVal: Int?): String =
+    when {
+      mateVal != null && mateVal > 0 -> "#M$mateVal"
+      mateVal != null && mateVal < 0 -> "-#M${-mateVal}"
+      mateVal == 0 -> if (board.sideToMove == PieceColor.WHITE) "0-1" else "1-0"
+      else -> {
+        val pawns = evalCp / 100.0
+        if (pawns >= 0) String.format("+%.1f", pawns) else String.format("%.1f", pawns)
+      }
+    }
+
   internal fun parseUciFromBestMove(bestmoveField: String): String? {
-    // Expected format: "bestmove b7b6 ponder f3e5" or "bestmove e2e4"
     val tokens = bestmoveField.trim().split(Regex("\\s+"))
     val idx = tokens.indexOf("bestmove")
     val candidate =

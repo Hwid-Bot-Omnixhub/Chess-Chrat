@@ -225,4 +225,62 @@ class ChessEngineUnitTest {
       tracker.fen(afterE4),
     )
   }
+
+  @Test
+  fun boardFinderLocates8x8BoardSurroundedByUiChrome() {
+    val w = 216
+    val h = 420
+    val px = IntArray(w * h) { 0xFF1E222A.toInt() } // dark app background
+
+    // Draw top header bar and bottom controls outside the board
+    for (y in 0 until 60) {
+      for (x in 0 until w) px[y * w + x] = 0xFF2B313C.toInt()
+    }
+    for (y in 320 until h) {
+      for (x in 0 until w) px[y * w + x] = 0xFF252A34.toInt()
+    }
+
+    // Place an 8x8 chessboard of size 192x192 (sq = 24) at (12, 96)
+    val bx = 12
+    val by = 96
+    val sq = 24
+    for (r in 0 until 8) {
+      for (c in 0 until 8) {
+        val isLight = (r + c) % 2 == 0
+        var bg = if (isLight) 0xFFEEEED2.toInt() else 0xFF769656.toInt()
+        if (r == 6 && c == 4) bg = 0xFFBACA44.toInt() // highlighted last-move square
+        for (dy in 0 until sq) {
+          for (dx in 0 until sq) {
+            val pxX = bx + c * sq + dx
+            val pxY = by + r * sq + dy
+            // Draw pieces on top 2 and bottom 2 ranks
+            val inCenter = dx in 6 until 18 && dy in 6 until 18
+            val color =
+              if ((r <= 1 || r >= 6) && inCenter) {
+                if (r <= 1) 0xFF202020.toInt() else 0xFFF8F8F8.toInt()
+              } else {
+                bg
+              }
+            px[pxY * w + pxX] = color
+          }
+        }
+      }
+    }
+
+    val rect = com.example.chessreviewer.BoardFinder.findInPixels(px, w, h)
+    assertNotNull("Expected BoardFinder to detect the 8x8 board", rect)
+    assertTrue("Expected x close to $bx, got ${rect!!.x}", kotlin.math.abs(rect.x - bx) <= 4)
+    assertTrue("Expected y close to $by, got ${rect.y}", kotlin.math.abs(rect.y - by) <= 4)
+    assertTrue("Expected size close to ${sq * 8}, got ${rect.size}", kotlin.math.abs(rect.size - sq * 8) <= 8)
+  }
+
+  @Test
+  fun startingPositionHasNoPlantedBookTheoryTags() = runTest {
+    val start = BoardState.startingPosition()
+    val local = ChessEngine.analyze(start, depth = 2)
+    assertTrue(local.topMoves.isNotEmpty())
+    assertTrue(local.topMoves.none { it.tacticalTag.contains("Book", ignoreCase = true) })
+    assertEquals(null, local.openingName)
+  }
 }
+

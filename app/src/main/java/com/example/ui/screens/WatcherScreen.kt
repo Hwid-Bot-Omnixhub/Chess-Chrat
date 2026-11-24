@@ -49,6 +49,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -94,6 +95,13 @@ fun WatcherScreen(
     rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
       viewModel.onMediaProjectionResult(res.resultCode, res.data)
     }
+
+  LaunchedEffect(shared.shizukuReady) {
+    while (!shared.shizukuReady) {
+      kotlinx.coroutines.delay(1500L)
+      viewModel.refreshSystemStatus()
+    }
+  }
 
   Column(
     modifier =
@@ -277,11 +285,17 @@ fun WatcherScreen(
           subtitle =
             when {
               shared.shizukuReady -> "Connected (uid 2000 shell) — works on protected screens"
-              shared.shizukuRunning -> "Shizuku is running — grant permission to enable"
+              shared.shizukuRunning -> "Shizuku is running — tap Grant to allow capture"
+              shared.shizukuInstalled -> "Shizuku installed — start Shizuku or tap Open"
               else -> "Optional: reads FLAG_SECURE boards without root via Shizuku"
             },
           granted = shared.shizukuReady,
-          actionLabel = if (shared.shizukuRunning) "Grant" else "Setup",
+          actionLabel =
+            when {
+              shared.shizukuRunning -> "Grant"
+              shared.shizukuInstalled -> "Open"
+              else -> "Setup"
+            },
           icon = Icons.Default.Security,
           buttonTag = "grant_shizuku_button",
           onGrant = { viewModel.requestShizukuPermission() },
@@ -308,7 +322,7 @@ fun WatcherScreen(
         HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.5f))
 
         ToggleSettingRow(
-          title = "Auto-Scan Board Moves (Hands-Free Arrow Sync)",
+          title = "Auto Board Finder & Live Sync (Zero Planted Moves)",
           checked = shared.autoBoardScanEnabled,
           onCheckedChange = viewModel::setAutoBoardScan,
           tag = "auto_scan_switch",
@@ -342,7 +356,7 @@ fun WatcherScreen(
             shape = RoundedCornerShape(10.dp),
             modifier = Modifier.weight(1f).height(48.dp).testTag("scan_board_button"),
           ) {
-            Text("Check Board")
+            Text("Find & Sync")
           }
         }
       }

@@ -39,7 +39,7 @@ data class UserPreferences(
   val statsHudY: Int = 1080,
   val visionTemplates: String? = null,
   val visionWhiteBottom: Boolean = true,
-  val autoBoardScan: Boolean = false,
+  val autoBoardScan: Boolean = true,
 )
 
 class PreferencesRepository(private val context: Context) {
@@ -103,7 +103,7 @@ class PreferencesRepository(private val context: Context) {
         statsHudY = prefs[Keys.STATS_HUD_Y] ?: 1080,
         visionTemplates = prefs[Keys.VISION_TEMPLATES],
         visionWhiteBottom = prefs[Keys.VISION_WHITE_BOTTOM] ?: true,
-        autoBoardScan = prefs[Keys.AUTO_BOARD_SCAN] ?: false,
+        autoBoardScan = prefs[Keys.AUTO_BOARD_SCAN] ?: true,
       )
     }
 

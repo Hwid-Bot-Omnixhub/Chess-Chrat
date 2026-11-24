@@ -139,47 +139,9 @@ object ChessEngine {
       -50, -30, -30, -30, -30, -30, -30, -50,
     )
 
-  private data class BookEntry(val name: String, val preferredUcis: List<String>)
-
-  private val OPENING_BOOK: Map<String, BookEntry> =
-    mapOf(
-      "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -" to
-        BookEntry("Starting Position", listOf("e2e4", "d2d4", "c2c4")),
-      "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3" to
-        BookEntry("King's Pawn Opening", listOf("c7c5", "e7e5", "e7e6")),
-      "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq e6" to
-        BookEntry("Open Game (1.e4 e5)", listOf("g1f3", "f1c4", "b1c3")),
-      "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq c6" to
-        BookEntry("Sicilian Defense", listOf("g1f3", "b1c3", "c2c3")),
-      "rnbqkbnr/pppp1ppp/4p3/8/4P3/8/PPPP1PPP/RNBQKBNR w KQkq -" to
-        BookEntry("French Defense", listOf("d2d4", "g1f3", "b1c3")),
-      "rnbqkbnr/pp1ppppp/2p5/8/4P3/8/PPPP1PPP/RNBQKBNR w KQkq -" to
-        BookEntry("Caro-Kann Defense", listOf("d2d4", "b1c3", "g1f3")),
-      "rnbqkbnr/pppp1ppp/8/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq -" to
-        BookEntry("King's Knight Opening", listOf("b8c6", "g8f6", "d7d6")),
-      "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq -" to
-        BookEntry("Ruy Lopez / Italian Setup", listOf("f1b5", "f1c4", "d2d4")),
-      "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq -" to
-        BookEntry("Ruy Lopez (Spanish Game)", listOf("a7a6", "g8f6", "f8c5")),
-      "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq -" to
-        BookEntry("Italian Game", listOf("f8c5", "g8f6", "f8e7")),
-      "rnbqkbnr/pppppppp/8/8/3P4/8/PPPP1PPP/RNBQKBNR b KQkq d3" to
-        BookEntry("Queen's Pawn Opening", listOf("g8f6", "d7d5", "e7e6")),
-      "rnbqkbnr/ppp1pppp/8/3p4/3P4/8/PPPP1PPP/RNBQKBNR w KQkq d6" to
-        BookEntry("Closed Game (1.d4 d5)", listOf("c2c4", "c1f4", "g1f3")),
-      "rnbqkbnr/ppp1pppp/8/3p4/2PP4/8/PP2PPPP/RNBQKBNR b KQkq c3" to
-        BookEntry("Queen's Gambit", listOf("e7e6", "c7c6", "d5c4")),
-      "rnbqkb1r/pppppppp/5n2/8/3P4/8/PPPP1PPP/RNBQKBNR w KQkq -" to
-        BookEntry("Indian Defense", listOf("c2c4", "g1f3", "c1f4")),
-      "rnbqkb1r/pppppppp/5n2/8/2PP4/8/PP2PPPP/RNBQKBNR b KQkq c3" to
-        BookEntry("Indian Game (1.d4 Nf6 2.c4)", listOf("e7e6", "g7g6", "c7c5")),
-      "rnbqkbnr/ppp1pppp/8/3p4/3P1B2/8/PPP1PPPP/RN1QKBNR b KQkq -" to
-        BookEntry("London System", listOf("g8f6", "c7c5", "e7e6")),
-    )
-
   /**
    * Fast synchronous/local analysis with Transposition Table & Iterative Deepening time budget.
-   * Safe for unit tests and offline fallback.
+   * Zero planted/book overrides — all moves are searched and scored genuinely.
    */
   suspend fun analyze(
     board: BoardState,
@@ -192,10 +154,9 @@ object ChessEngine {
     val fen = board.toFen()
     val legalMoves = ChessRules.generateLegalMoves(board)
     val status = ChessRules.evaluateGameStatus(board, legalMoves)
-    val opening = OPENING_BOOK[board.positionKey()]
 
     if (legalMoves.isEmpty()) {
-      return terminalAnalysis(fen, status, opening?.name, targetElo)
+      return terminalAnalysis(fen, status, null, targetElo)
     }
 
     val tt = HashMap<String, TTEntry>(4096)
@@ -212,7 +173,6 @@ object ChessEngine {
         orderMoves(
           board = board,
           moves = legalMoves,
-          bookUcis = opening?.preferredUcis.orEmpty(),
           ttMoveUci = pvHintUci,
         )
       val currentScores = ArrayList<Pair<Move, Int>>(ordered.size)
@@ -225,11 +185,7 @@ object ChessEngine {
           break
         }
         val next = ChessRules.applyMove(board, move)
-        var score = -alphaBeta(next, d - 1, -INF, INF, 1, tt, deadlineNs, allowTimeout = d > 1)
-        val bookIdx = opening?.preferredUcis?.indexOf(move.uci) ?: -1
-        if (bookIdx >= 0) {
-          score += (3 - bookIdx) * 14
-        }
+        val score = -alphaBeta(next, d - 1, -INF, INF, 1, tt, deadlineNs, allowTimeout = d > 1)
         currentScores.add(move to score)
       }
 
@@ -238,7 +194,6 @@ object ChessEngine {
         bestIterationScores = currentScores
         depthReached = d
         pvHintUci = currentScores.first().first.uci
-        // Stop early if forced mate already found
         if (abs(currentScores.first().second) >= MATE_SCORE - 200) break
       } else {
         break
@@ -258,7 +213,7 @@ object ChessEngine {
         val matePlies = extractMatePlies(rawScoreForMover)
         val san = ChessRules.toSan(board, move, legalMoves)
         val pv = buildPrincipalVariation(board, move, maxPlies = 4)
-        val tag = classifyMove(board, move, san, matePlies, index == 0, opening?.preferredUcis)
+        val tag = classifyMove(board, move, san, matePlies, index == 0)
         SuggestedMove(
           rank = index + 1,
           move = move,
@@ -282,7 +237,7 @@ object ChessEngine {
       scoreDisplay = best.scoreDisplay,
       topMoves = topMoves,
       opponentThreat = threat,
-      openingName = opening?.name,
+      openingName = null,
       depthReached = depthReached,
       status = status,
       engineSource = "Local D$depthReached",
@@ -320,18 +275,17 @@ object ChessEngine {
 
     val legalMoves = ChessRules.generateLegalMoves(board)
     val status = ChessRules.evaluateGameStatus(board, legalMoves)
-    val opening = OPENING_BOOK[board.positionKey()]
     if (legalMoves.isEmpty()) {
-      return terminalAnalysis(fen, status, opening?.name, clampedElo)
+      return terminalAnalysis(fen, status, null, clampedElo)
     }
 
     val totalStartNs = System.nanoTime()
 
-    // Stage 1: Instant local pass; Anti-Lag tightens budget to <= 22ms so UI/overlay never drops frames
+    // Stage 1: Fast local search for opponent threat detection & immediate responsiveness
     val (localTargetDepth, rawBudgetMs) = EloDepthMapper.eloToLocalBudget(clampedElo)
-    val localBudgetMs = if (antiLagEnabled) minOf(rawBudgetMs, 140L) else rawBudgetMs
+    val localBudgetMs = if (antiLagEnabled) minOf(rawBudgetMs, 160L) else rawBudgetMs
     val quickDepth = if (useStockfishApi || localTargetDepth > 2) 2 else localTargetDepth
-    val quickBudgetMs = if (antiLagEnabled) 22L else 35L
+    val quickBudgetMs = if (antiLagEnabled) 24L else 38L
     val quickLocal =
       analyze(
         board = board,
@@ -345,9 +299,12 @@ object ChessEngine {
       return quickLocal
     }
 
-    onQuickPreview?.invoke(quickLocal)
+    // Only emit quick preview immediately if Stockfish isn't enabled, so arrows always reflect true AI analysis
+    if (!useStockfishApi) {
+      onQuickPreview?.invoke(quickLocal)
+    }
 
-    // Stage 2: Native Stockfish UCI (if libstockfish.so bundled) -> Stockfish Online API (depth 1..15)
+    // Stage 2: Native Stockfish UCI (if libstockfish.so bundled) -> Cloud Stockfish (Stockfish Online + Lichess Cloud)
     val native = nativeEngine
     if (useStockfishApi && native != null && native.available()) {
       val nativeElo = if (clampedElo >= 3190) null else clampedElo.coerceIn(600, 3190)
@@ -374,10 +331,10 @@ object ChessEngine {
                 if (board.sideToMove == PieceColor.WHITE) nativeResult.cp else -nativeResult.cp
               else -> quickLocal.evalCp
             }
-          val mateAbs = nativeResult.mate?.let { kotlin.math.abs(it) }
+          val mateAbs = nativeResult.mate?.let { abs(it) }
           val display = formatScore(whiteCp, mateAbs, board.sideToMove)
           val pv = buildPrincipalVariation(board, matched, maxPlies = 4)
-          val tag = classifyMove(board, matched, san, mateAbs, true, opening?.preferredUcis)
+          val tag = classifyMove(board, matched, san, mateAbs, true)
           val mergedTop =
             buildList {
               add(
@@ -439,12 +396,21 @@ object ChessEngine {
                 tacticalTag = sfResult.tacticalTag,
               ),
             )
-            val secondary =
-              quickLocal.topMoves
-                .filter { it.move.uci != sfResult.bestMove.uci }
-                .take(2)
-                .mapIndexed { idx, m -> m.copy(rank = idx + 2) }
-            addAll(secondary)
+            if (sfResult.extraTopMoves.isNotEmpty()) {
+              addAll(
+                sfResult.extraTopMoves
+                  .filter { it.move.uci != sfResult.bestMove.uci }
+                  .take(2)
+                  .mapIndexed { idx, m -> m.copy(rank = idx + 2) },
+              )
+            } else {
+              addAll(
+                quickLocal.topMoves
+                  .filter { it.move.uci != sfResult.bestMove.uci }
+                  .take(2)
+                  .mapIndexed { idx, m -> m.copy(rank = idx + 2) },
+              )
+            }
           }
 
         val elapsedMs = ((System.nanoTime() - totalStartNs) / 1_000_000L).coerceAtLeast(1L)
@@ -455,7 +421,7 @@ object ChessEngine {
             scoreDisplay = sfResult.scoreDisplay,
             topMoves = mergedTop,
             depthReached = sfResult.depth,
-            engineSource = "Stockfish D${sfResult.depth}",
+            engineSource = sfResult.sourceLabel,
             analysisTimeMs = elapsedMs,
             targetElo = clampedElo,
           )
@@ -533,7 +499,7 @@ object ChessEngine {
     val staticEval = evaluateStatic(flipped)
     val deadlineNs = System.nanoTime() + 30_000_000L
 
-    for (move in orderMoves(flipped, oppMoves, emptyList()).take(10)) {
+    for (move in orderMoves(flipped, oppMoves).take(10)) {
       coroutineContext.ensureActive()
       val next = ChessRules.applyMove(flipped, move)
       val score = -alphaBeta(next, 1, -INF, INF, 1, tt, deadlineNs, allowTimeout = true)
@@ -603,7 +569,7 @@ object ChessEngine {
 
     var alpha = alphaInit
     val origAlpha = alphaInit
-    val ordered = orderMoves(board, legalMoves, emptyList(), ttEntry?.bestMoveUci)
+    val ordered = orderMoves(board, legalMoves, ttEntry?.bestMoveUci)
     var bestMoveUci: String? = null
     var bestScore = -INF
 
@@ -649,7 +615,7 @@ object ChessEngine {
     val captures = ChessRules.generateLegalCaptures(board)
     if (captures.isEmpty()) return alpha
 
-    val ordered = orderMoves(board, captures, emptyList())
+    val ordered = orderMoves(board, captures)
     for (move in ordered) {
       val next = ChessRules.applyMove(board, move)
       val score = -quiescence(next, -beta, -alpha, qDepth - 1)
@@ -662,13 +628,11 @@ object ChessEngine {
   private fun orderMoves(
     board: BoardState,
     moves: List<Move>,
-    bookUcis: List<String>,
     ttMoveUci: String? = null,
   ): List<Move> {
     return moves.sortedByDescending { move ->
       var score = 0
       if (ttMoveUci != null && move.uci == ttMoveUci) score += 30_000
-      if (move.uci in bookUcis) score += 20_000
       val captured = move.captured
       if (captured != null) {
         val attacker = board.pieceAt(move.from)?.type?.valueCp ?: 100
@@ -749,7 +713,7 @@ object ChessEngine {
       val nextLegal = ChessRules.generateLegalMoves(currBoard)
       if (nextLegal.isEmpty()) return@repeat
       currMove =
-        orderMoves(currBoard, nextLegal, emptyList())
+        orderMoves(currBoard, nextLegal)
           .take(8)
           .maxByOrNull { reply -> evaluateStatic(ChessRules.applyMove(currBoard, reply)) * -1 }
     }
@@ -762,11 +726,9 @@ object ChessEngine {
     san: String,
     matePlies: Int?,
     isTop: Boolean,
-    bookUcis: List<String>?,
   ): String {
     if (san.endsWith('#') || matePlies != null) return "Mate Sequence"
     if (san.endsWith('+')) return "Check"
-    if (bookUcis != null && move.uci in bookUcis) return "Book Theory"
     if (move.isCastle) return "King Safety"
     if (move.promotion != null) return "Promotion"
     val captured = move.captured

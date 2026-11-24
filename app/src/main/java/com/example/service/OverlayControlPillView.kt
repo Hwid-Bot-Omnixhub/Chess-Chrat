@@ -135,8 +135,8 @@ class OverlayControlPillView(
     strip.addView(learnBtn, marginParams())
 
     scanBtn =
-      makeChipButton("Scan", "#1A222C", "#38BDF8") { onScanBoard() }.apply {
-        contentDescription = "Check board position from screen once"
+      makeChipButton("Find", "#1A222C", "#38BDF8") { onScanBoard() }.apply {
+        contentDescription = "Auto-find 8x8 board on screen and analyze position"
       }
     strip.addView(scanBtn, marginParams())
 

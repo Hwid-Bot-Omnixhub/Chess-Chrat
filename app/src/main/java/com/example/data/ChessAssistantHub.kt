@@ -61,10 +61,11 @@ data class AssistantSharedState(
   val overlayBoardSizePx: Int = 780,
   val statsHudX: Int = 36,
   val statsHudY: Int = 1080,
-  val autoBoardScanEnabled: Boolean = false,
+  val autoBoardScanEnabled: Boolean = true,
   val visionTemplatesReady: Boolean = false,
   val visionWhiteBottom: Boolean = true,
-  val boardCheckerStatus: String = "Align frame over board & tap Learn on starting position",
+  val boardCheckerStatus: String = "Auto Board Finder ready — enable Screen Capture or Shizuku",
+  val shizukuInstalled: Boolean = false,
   val shizukuRunning: Boolean = false,
   val shizukuReady: Boolean = false,
   val mediaProjectionReady: Boolean = false,
@@ -427,12 +428,14 @@ object ChessAssistantHub {
   }
 
   fun setCaptureReadiness(
+    shizukuInstalled: Boolean = _state.value.shizukuInstalled,
     shizukuRunning: Boolean = _state.value.shizukuRunning,
     shizukuReady: Boolean = _state.value.shizukuReady,
     mediaProjectionReady: Boolean = _state.value.mediaProjectionReady,
   ) {
     _state.update {
       it.copy(
+        shizukuInstalled = shizukuInstalled,
         shizukuRunning = shizukuRunning,
         shizukuReady = shizukuReady,
         mediaProjectionReady = mediaProjectionReady,

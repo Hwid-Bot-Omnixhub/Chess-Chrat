@@ -299,16 +299,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
   fun requestShizukuPermission() {
     val ctx = getApplication<Application>()
+    BoardVisionScanner.refreshReadiness(ctx)
     val requested = BoardVisionScanner.requestShizukuPermission(ctx)
-    if (!requested) {
-      val opened = SystemAccessHelper.launchApp(ctx, "moe.shizuku.privileged.api")
+    if (requested) {
+      val readyNow = BoardVisionScanner.ensureInitialized(ctx).shizuku.ready()
       _uiState.update {
         it.copy(
           statusMessage =
-            if (opened) "Start Shizuku via Wireless Debugging, then return here"
-            else "Shizuku not running — use Enable Capture (No Root) instead",
+            if (readyNow) "Shizuku connected (uid 2000 shell non-root ready)"
+            else "Approve the Shizuku permission popup to enable capture",
         )
       }
+      return
+    }
+    val opened = SystemAccessHelper.launchApp(ctx, "moe.shizuku.privileged.api")
+    _uiState.update {
+      it.copy(
+        statusMessage =
+          if (opened) "Start Shizuku via Wireless Debugging, then switch back here"
+          else "Shizuku not running — use Enable Screen Capture (No Root) below",
+      )
     }
   }
 
@@ -325,6 +335,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
       }
       return
     }
+    ChessAssistantHub.setAutoBoardScan(true)
+    viewModelScope.launch { prefsRepo.updateAutoBoardScan(true) }
     ChessAssistantHub.setOverlayServiceState(
       running = true,
       gridVisible = true,
@@ -333,7 +345,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     )
     ChessOverlayService.startWithProjection(ctx, resultCode, data)
     _uiState.update {
-      it.copy(statusMessage = "Non-root Screen Capture ready — Board Checker enabled")
+      it.copy(statusMessage = "Non-root Screen Capture ready — Auto Board Finder active")
     }
   }
 
@@ -356,18 +368,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
       return
     }
     viewModelScope.launch {
-      val outcome = BoardVisionScanner.scanBoardOnce(ctx, isAuto = false)
+      val outcome = BoardVisionScanner.scanBoardOnce(ctx, prefsRepo = prefsRepo, isAuto = false)
       _uiState.update { it.copy(statusMessage = outcome.message) }
     }
   }
 
   fun setAutoBoardScan(enabled: Boolean) {
-    if (enabled && !_uiState.value.shared.visionTemplatesReady) {
-      _uiState.update {
-        it.copy(statusMessage = "Tap Learn on a starting chess board first")
-      }
-      return
-    }
     ChessAssistantHub.setAutoBoardScan(enabled)
     viewModelScope.launch { prefsRepo.updateAutoBoardScan(enabled) }
   }

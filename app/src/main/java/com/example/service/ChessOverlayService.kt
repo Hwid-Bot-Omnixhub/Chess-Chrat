@@ -234,15 +234,16 @@ class ChessOverlayService : Service() {
     }
   }
 
-  private fun runScanOnceFromService() {
+  private fun runScanOnceFromService(isAuto: Boolean = false) {
     serviceScope.launch {
       val outcome =
         BoardVisionScanner.scanBoardOnce(
           context = applicationContext,
-          isAuto = false,
+          prefsRepo = prefsRepo,
+          isAuto = isAuto,
           pulseHideOverlay = ::setOverlayHiddenForCapture,
         )
-      if (!outcome.success) {
+      if (!isAuto && !outcome.success) {
         withContext(Dispatchers.Main) {
           Toast.makeText(applicationContext, outcome.message, Toast.LENGTH_SHORT).show()
         }
@@ -361,15 +362,10 @@ class ChessOverlayService : Service() {
           onToggleAutoScan = {
             val cur = ChessAssistantHub.state.value
             val next = !cur.autoBoardScanEnabled
-            if (next && !cur.visionTemplatesReady) {
-              Toast.makeText(
-                applicationContext,
-                "Tap Learn on a starting board first",
-                Toast.LENGTH_SHORT,
-              ).show()
-            } else {
-              ChessAssistantHub.setAutoBoardScan(next)
-              serviceScope.launch(Dispatchers.IO) { prefsRepo.updateAutoBoardScan(next) }
+            ChessAssistantHub.setAutoBoardScan(next)
+            serviceScope.launch(Dispatchers.IO) { prefsRepo.updateAutoBoardScan(next) }
+            if (next && BoardVisionScanner.isCaptureAvailable(applicationContext)) {
+              runScanOnceFromService(isAuto = true)
             }
           },
           onToggleGrid = {
@@ -514,6 +510,7 @@ class ChessOverlayService : Service() {
     watcherJob =
       serviceScope.launch(Dispatchers.Default) {
         while (isActive) {
+          BoardVisionScanner.refreshReadiness(applicationContext)
           val st = ChessAssistantHub.state.value
           if (st.watcherEnabled) {
             val poll = watcherMonitor.pollForegroundChessApp(st.watchedPackages)
@@ -529,6 +526,10 @@ class ChessOverlayService : Service() {
                   passThrough = true,
                   tapSync = false,
                 )
+                if (BoardVisionScanner.isCaptureAvailable(applicationContext)) {
+                  delay(450L)
+                  runScanOnceFromService(isAuto = true)
+                }
               }
               updateNotification(detected?.displayName)
             }
@@ -549,18 +550,18 @@ class ChessOverlayService : Service() {
         while (isActive) {
           val st = ChessAssistantHub.state.value
           if (st.autoBoardScanEnabled &&
-            st.visionTemplatesReady &&
             st.overlayGridVisible &&
             st.overlayPassThrough &&
             BoardVisionScanner.isCaptureAvailable(applicationContext)
           ) {
             BoardVisionScanner.scanBoardOnce(
               context = applicationContext,
+              prefsRepo = prefsRepo,
               isAuto = true,
               pulseHideOverlay = ::setOverlayHiddenForCapture,
             )
           }
-          delay(if (st.antiLagEnabled) 1700L else 1050L)
+          delay(if (st.antiLagEnabled) 1500L else 950L)
         }
       }
   }

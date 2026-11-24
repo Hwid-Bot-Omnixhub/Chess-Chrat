@@ -30,7 +30,9 @@ class ShizukuCapture(private val appContext: Context) {
     private var latch: CountDownLatch? = null
 
     private val userServiceArgs: Shizuku.UserServiceArgs by lazy {
-        Shizuku.UserServiceArgs(ComponentName(appContext, SecureShotService::class.java))
+        Shizuku.UserServiceArgs(
+            ComponentName(appContext.packageName, SecureShotService::class.java.name)
+        )
             .daemon(false)
             .processNameSuffix("secureshot")
             .debuggable(false)
@@ -52,6 +54,13 @@ class ShizukuCapture(private val appContext: Context) {
         }
     }
 
+    fun isAppInstalled(): Boolean = try {
+        appContext.packageManager.getPackageInfo("moe.shizuku.privileged.api", 0)
+        true
+    } catch (_: Throwable) {
+        false
+    }
+
     fun isRunning(): Boolean = try {
         Shizuku.pingBinder()
     } catch (_: Throwable) {
@@ -69,7 +78,11 @@ class ShizukuCapture(private val appContext: Context) {
     fun requestPermission(requestCode: Int = SHIZUKU_PERMISSION_REQUEST_CODE): Boolean {
         return try {
             if (!isRunning()) {
-                lastError = "Shizuku service is not running"
+                lastError = if (isAppInstalled()) {
+                    "Shizuku binder not connected yet — open Shizuku once or toggle its service"
+                } else {
+                    "Shizuku app is not installed"
+                }
                 false
             } else if (Shizuku.isPreV11()) {
                 lastError = "Shizuku v11+ is required"
